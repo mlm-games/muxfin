@@ -57,6 +57,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             codec: AudioCodec::Aac(profile),
             sample_rate: 48000,
             channels: 2,
+            timescale: 48000,
+            language: muxfin::time::LanguageCode::UND,
         }),
         metadata: None,
         fast_start: true,

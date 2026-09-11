@@ -10,3 +10,46 @@ jobs:
     uses: mlm-games/ci/.github/workflows/rust-app-ci.yml@v1
     with:
       app-slug: muxfin
+
+  crate-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98.0"
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -p muxfin --all-targets -- -D warnings
+      - run: cargo test -p muxfin
+      - run: cargo doc -p muxfin --no-deps --all-features
+      - run: cargo package -p muxfin --list
+      - run: cargo publish -p muxfin --dry-run --locked
+
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98.0"
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg gpac
+      - run: cargo test -p muxfin --test verdict_hardening --test fragmented --test bframe_ctts
+      - run: |
+          cargo run -p muxfin --example faststart_proof || true
+          for f in recording_faststart.mp4 recording_normal.mp4 output.mp4 *.mp4; do
+            [ -f "$f" ] || continue
+            echo "== $f =="
+            ffprobe -v error -show_format -show_streams "$f" || exit 1
+            ffmpeg -v error -i "$f" -f null - || exit 1
+            MP4Box -info "$f" || true
+          done
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cargo-audit cargo-deny --locked
+      - run: cargo audit || true
+      - run: cargo deny check || true

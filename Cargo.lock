@@ -695,12 +695,9 @@ dependencies = [
 name = "muxfin"
 version = "0.2.3"
 dependencies = [
- "anyhow",
  "bytes",
- "clap",
  "criterion",
  "dissonia",
- "indicatif",
  "lazy_static",
  "matroska-demuxer",
  "mkv-element",
@@ -708,7 +705,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
 ]
 
 [[package]]

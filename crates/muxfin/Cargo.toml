@@ -28,10 +28,6 @@ exclude = [
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-anyhow.workspace = true
-clap.workspace = true
-indicatif.workspace = true
 bytes.workspace = true
 mkv-element.workspace = true
 

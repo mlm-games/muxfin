@@ -69,18 +69,47 @@ pub mod nal_type {
 /// hvcC box in MP4 containers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HevcConfig {
-    /// Video Parameter Set NAL unit (without start code)
+    /// First Video Parameter Set (compat; without start code)
     pub vps: Vec<u8>,
-    /// Sequence Parameter Set NAL unit (without start code)
+    /// First Sequence Parameter Set (compat; without start code)
     pub sps: Vec<u8>,
-    /// Picture Parameter Set NAL unit (without start code)
+    /// First Picture Parameter Set (compat; without start code)
     pub pps: Vec<u8>,
+    /// All VPS units (verdict §8; first == `vps`).
+    pub video_parameter_sets: Vec<Vec<u8>>,
+    /// All SPS units (verdict §8; first == `sps`).
+    pub sequence_parameter_sets: Vec<Vec<u8>>,
+    /// All PPS units (verdict §8; first == `pps`).
+    pub picture_parameter_sets: Vec<Vec<u8>>,
+    /// NAL length size (always 4 in muxfin output).
+    pub nal_length_size: u8,
 }
 
 impl HevcConfig {
     /// Create a new HEVC configuration from VPS, SPS, and PPS data.
     pub fn new(vps: Vec<u8>, sps: Vec<u8>, pps: Vec<u8>) -> Self {
-        Self { vps, sps, pps }
+        Self {
+            video_parameter_sets: vec![vps.clone()],
+            sequence_parameter_sets: vec![sps.clone()],
+            picture_parameter_sets: vec![pps.clone()],
+            vps,
+            sps,
+            pps,
+            nal_length_size: 4,
+        }
+    }
+
+    /// Caller-supplied multi-PS config (verdict §8).
+    pub fn from_arrays(vps: Vec<Vec<u8>>, sps: Vec<Vec<u8>>, pps: Vec<Vec<u8>>) -> Option<Self> {
+        Some(Self {
+            vps: vps.first()?.clone(),
+            sps: sps.first()?.clone(),
+            pps: pps.first()?.clone(),
+            video_parameter_sets: vps,
+            sequence_parameter_sets: sps,
+            picture_parameter_sets: pps,
+            nal_length_size: 4,
+        })
     }
 
     /// Extract general_profile_space from the SPS (bits 0-1 of byte 3).
@@ -176,13 +205,17 @@ pub fn extract_hevc_config(data: &[u8]) -> Option<HevcConfig> {
         return None;
     }
 
-    let mut vps: Option<&[u8]> = None;
-    let mut sps: Option<&[u8]> = None;
-    let mut pps: Option<&[u8]> = None;
+    let mut vps_list: Vec<Vec<u8>> = Vec::new();
+    let mut sps_list: Vec<Vec<u8>> = Vec::new();
+    let mut pps_list: Vec<Vec<u8>> = Vec::new();
 
     for nal in AnnexBNalIter::new(data) {
         if nal.is_empty() {
             continue;
+        }
+        // forbidden_zero_bit must be 0.
+        if nal[0] & 0x80 != 0 {
+            return None;
         }
 
         let nal_type = hevc_nal_type(nal);
@@ -193,30 +226,18 @@ pub fn extract_hevc_config(data: &[u8]) -> Option<HevcConfig> {
         );
 
         match nal_type {
-            nal_type::VPS if vps.is_none() => vps = Some(nal),
-            nal_type::SPS if sps.is_none() => sps = Some(nal),
-            nal_type::PPS if pps.is_none() => pps = Some(nal),
+            nal_type::VPS => vps_list.push(nal.to_vec()),
+            nal_type::SPS => sps_list.push(nal.to_vec()),
+            nal_type::PPS => pps_list.push(nal.to_vec()),
             _ => {}
-        }
-
-        // Early exit once we have all three
-        if vps.is_some() && sps.is_some() && pps.is_some() {
-            break;
         }
     }
 
     // Verify we found all required parameter sets
-    if let (Some(vps_data), Some(sps_data), Some(pps_data)) = (vps, sps, pps) {
-        assert_invariant!(
-            !vps_data.is_empty() && !sps_data.is_empty() && !pps_data.is_empty(),
-            "INV-502: HEVC VPS, SPS, and PPS must be non-empty"
-        );
+    if !vps_list.is_empty() && !sps_list.is_empty() && !pps_list.is_empty() {
+        assert_invariant!(true, "INV-502: HEVC VPS, SPS, and PPS must be non-empty");
 
-        Some(HevcConfig {
-            vps: vps_data.to_vec(),
-            sps: sps_data.to_vec(),
-            pps: pps_data.to_vec(),
-        })
+        HevcConfig::from_arrays(vps_list, sps_list, pps_list)
     } else {
         None
     }

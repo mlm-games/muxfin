@@ -10,6 +10,7 @@ fn test_fragmented_dts_must_be_monotonic() {
         height: 1080,
         timescale: 90000,
         fragment_duration_ms: 2000,
+        boundary: muxfin::api::SegmentBoundary::Manual,
         sps: vec![0x00, 0x00, 0x00, 0x01, 0x67], // Fake SPS
         pps: vec![0x00, 0x00, 0x00, 0x01, 0x68], // Fake PPS
         vps: None,
@@ -47,6 +48,10 @@ fn test_fragmented_basic_functionality() {
         height: 1080,
         timescale: 90000,
         fragment_duration_ms: 2000,
+        boundary: muxfin::api::SegmentBoundary::Duration {
+            target: 180_000,
+            require_sync_sample: false,
+        },
         sps: vec![0x00, 0x00, 0x00, 0x01, 0x67], // Fake SPS
         pps: vec![0x00, 0x00, 0x00, 0x01, 0x68], // Fake PPS
         vps: None,
@@ -94,6 +99,7 @@ fn test_fragmented_h265_basic() {
         height: 1080,
         timescale: 90000,
         fragment_duration_ms: 2000,
+        boundary: muxfin::api::SegmentBoundary::Manual,
         sps: vec![
             0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00,
         ], // Fake H.265 SPS
@@ -144,6 +150,7 @@ fn test_fragmented_av1_basic() {
         height: 1080,
         timescale: 90000,
         fragment_duration_ms: 2000,
+        boundary: muxfin::api::SegmentBoundary::Manual,
         sps: vec![], // Not used for AV1
         pps: vec![], // Not used for AV1
         vps: None,   // Not used for AV1
@@ -193,6 +200,7 @@ fn test_fragmented_vp9_basic() {
         height: 1080,
         timescale: 90000,
         fragment_duration_ms: 2000,
+        boundary: muxfin::api::SegmentBoundary::Manual,
         sps: vec![], // Not used for VP9
         pps: vec![], // Not used for VP9
         vps: None,   // Not used for VP9

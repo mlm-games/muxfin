@@ -79,6 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         timescale: 90_000,
         // Make it very easy to flush a segment with just a few frames.
         fragment_duration_ms: 1,
+        boundary: muxfin::api::SegmentBoundary::Manual,
         sps: avc.sps,
         pps: avc.pps,
         vps: None,

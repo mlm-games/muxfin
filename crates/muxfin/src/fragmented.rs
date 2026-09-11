@@ -70,6 +70,10 @@ pub struct FragmentConfig {
     pub timescale: u32,
     /// Target fragment duration in milliseconds.
     pub fragment_duration_ms: u32,
+    /// Segment flush policy (verdict §11). When `Duration` with
+    /// `require_sync_sample`, `ready_to_flush` only fires at a sync sample
+    /// so no GOP is split.
+    pub boundary: crate::api::SegmentBoundary,
     /// SPS NAL unit (H.264 required for init segment).
     pub sps: Vec<u8>,
     /// PPS NAL unit (H.264 required for init segment).
@@ -91,6 +95,10 @@ impl Default for FragmentConfig {
             height: 1080,
             timescale: 90000,
             fragment_duration_ms: 2000,
+            boundary: crate::api::SegmentBoundary::Duration {
+                target: 180_000, // 2000 ms at 90 kHz
+                require_sync_sample: true,
+            },
             sps: vec![0x67, 0x42, 0x00, 0x1e, 0xda, 0x02, 0x80, 0x2d, 0x8b, 0x11],
             pps: vec![0x68, 0xce, 0x38, 0x80],
             vps: None,
@@ -206,8 +214,8 @@ impl FragmentedMuxer {
             self.config.timescale,
         );
 
-        // Update state for next segment
-        self.sequence_number += 1;
+        // Update state for next segment (checked; saturate instead of wrapping).
+        self.sequence_number = self.sequence_number.checked_add(1).unwrap_or(u32::MAX);
         if let Some(last) = samples.last() {
             // Estimate next base_media_decode_time
             if samples.len() >= 2 {
@@ -223,21 +231,41 @@ impl FragmentedMuxer {
     }
 
     /// Check if we have enough samples to make a fragment.
+    ///
+    /// With `SegmentBoundary::Manual` this always returns false (caller
+    /// flushes explicitly). With `Duration{require_sync_sample:true}` the
+    /// target means "flush at the next sync sample", never mid-GOP.
     pub fn ready_to_flush(&self) -> bool {
-        if self.samples.is_empty() {
-            return false;
+        match self.config.boundary {
+            crate::api::SegmentBoundary::Manual => false,
+            crate::api::SegmentBoundary::Duration {
+                target: _,
+                require_sync_sample,
+            } => {
+                if self.samples.len() < 2 {
+                    return false;
+                }
+                let first_dts = self.samples[0].dts;
+                let last_dts = self.samples.last().unwrap().dts;
+                let duration_ticks = last_dts.saturating_sub(first_dts);
+                let duration_ms = duration_ticks * 1000 / self.config.timescale.max(1) as u64;
+                if duration_ms < self.config.fragment_duration_ms as u64 {
+                    return false;
+                }
+                if require_sync_sample {
+                    // Flush only at a sync sample so segments start with a
+                    // keyframe. Allow 4x overrun escape to avoid unbounded
+                    // growth when no sync arrives.
+                    if self.samples.last().is_some_and(|s| s.is_sync) {
+                        return true;
+                    }
+                    let overrun =
+                        duration_ms >= (self.config.fragment_duration_ms as u64).saturating_mul(4);
+                    return overrun && self.samples.iter().any(|s| s.is_sync);
+                }
+                true
+            }
         }
-
-        if self.samples.len() < 2 {
-            return false;
-        }
-
-        let first_dts = self.samples[0].dts;
-        let last_dts = self.samples.last().unwrap().dts;
-        let duration_ticks = last_dts.saturating_sub(first_dts);
-        let duration_ms = duration_ticks * 1000 / self.config.timescale as u64;
-
-        duration_ms >= self.config.fragment_duration_ms as u64
     }
 
     /// Get current fragment duration in milliseconds.
@@ -940,6 +968,10 @@ mod tests {
     fn ready_to_flush_tracks_sample_count_and_duration() {
         let config = FragmentConfig {
             fragment_duration_ms: 1,
+            boundary: crate::api::SegmentBoundary::Duration {
+                target: 90,
+                require_sync_sample: false,
+            },
             ..Default::default()
         };
         let mut muxer = FragmentedMuxer::new(config);
@@ -956,6 +988,30 @@ mod tests {
             muxer.ready_to_flush(),
             "two samples reaching duration should be ready"
         );
+    }
+
+    #[test]
+    fn ready_to_flush_requires_sync_when_gated() {
+        let config = FragmentConfig {
+            fragment_duration_ms: 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            config.boundary,
+            crate::api::SegmentBoundary::Duration {
+                require_sync_sample: true,
+                ..
+            }
+        ));
+        let mut muxer = FragmentedMuxer::new(config);
+        let sample_data = vec![0, 0, 0, 5, 0x65, 1, 2, 3, 4];
+        muxer.write_video(0, 0, &sample_data, true).unwrap();
+        // Duration reached but tail is non-sync: must NOT flush mid-GOP.
+        muxer.write_video(90, 90, &sample_data, false).unwrap();
+        assert!(!muxer.ready_to_flush());
+        // Sync tail: flush allowed.
+        muxer.write_video(180, 180, &sample_data, true).unwrap();
+        assert!(muxer.ready_to_flush());
     }
 
     #[test]

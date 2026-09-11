@@ -91,21 +91,17 @@ fn errors_are_specific_and_descriptive() -> Result<(), Box<dyn std::error::Error
         );
     }
 
-    // Audio must not arrive before first video frame.
+    // Audio arriving before video is now allowed (verdict §7): edit lists
+    // preserve A/V sync instead of rejecting. Verify it muxes.
     {
         let (writer, _) = SharedBuffer::new();
         let mut muxer = MuxerBuilder::new(writer)
             .video(VideoCodec::H264, 640, 480, 30.0)
             .audio(AudioCodec::Aac(AacProfile::Lc), 48_000, 2)
             .build()?;
-        // Write video first with pts 1.0
+        // Audio at 0.0 before video at 1.0 must succeed; elst handles offset.
+        muxer.write_audio(0.0, &[0xff, 0xf1, 0x4c, 0x80, 0x01, 0x3f, 0xfc, 0xaa, 0xbb])?;
         muxer.write_video(1.0, &frame0, true)?;
-        // Then audio with pts 0.0 (before video) should error
-        let err = muxer
-            .write_audio(0.0, &[0xff, 0xf1, 0x4c, 0x80, 0x01, 0x3f, 0xfc])
-            .unwrap_err();
-        assert!(matches!(err, MuxerError::AudioBeforeFirstVideo { .. }));
-        assert!(err.to_string().contains("video"));
     }
 
     // Invalid ADTS should surface as InvalidAdts.

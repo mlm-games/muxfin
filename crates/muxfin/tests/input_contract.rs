@@ -366,7 +366,8 @@ fn audio_pts_decreasing_is_rejected() {
 }
 
 #[test]
-fn audio_before_first_video_is_rejected() {
+fn audio_before_first_video_is_allowed_with_edit_list() {
+    // Verdict §7: audio may precede video; edit lists preserve sync.
     let (writer, _) = SharedBuffer::new();
     let mut muxer = MuxerBuilder::new(writer)
         .video(VideoCodec::H264, 640, 480, 30.0)
@@ -374,23 +375,12 @@ fn audio_before_first_video_is_rejected() {
         .build()
         .unwrap();
 
-    // No video written yet
-    let err = muxer.write_audio(0.0, &valid_adts_frame()).unwrap_err();
-
-    assert!(matches!(
-        err,
-        MuxerError::AudioBeforeFirstVideo {
-            first_video_pts: None,
-            ..
-        }
-    ));
-
-    let msg = err.to_string();
-    assert!(msg.contains("video"), "Error should mention video: {}", msg);
+    // No video written yet: must succeed now.
+    muxer.write_audio(0.0, &valid_adts_frame()).unwrap();
 }
 
 #[test]
-fn audio_pts_before_first_video_pts_is_rejected() {
+fn audio_pts_before_first_video_pts_is_allowed_with_edit_list() {
     let frame = read_hex_fixture("video_samples", "frame0_key.264");
     let (writer, _) = SharedBuffer::new();
     let mut muxer = MuxerBuilder::new(writer)
@@ -399,19 +389,10 @@ fn audio_pts_before_first_video_pts_is_rejected() {
         .build()
         .unwrap();
 
-    // Video starts at 1.0 second
+    // Verdict §7: audio at 0.5 before video at 1.0 must succeed; the video
+    // trak gets edts/elst so players keep A/V sync.
+    muxer.write_audio(0.5, &valid_adts_frame()).unwrap();
     muxer.write_video(1.0, &frame, true).unwrap();
-
-    // Audio at 0.5 seconds (before video)
-    let err = muxer.write_audio(0.5, &valid_adts_frame()).unwrap_err();
-
-    assert!(matches!(
-        err,
-        MuxerError::AudioBeforeFirstVideo {
-            audio_pts,
-            first_video_pts: Some(video_pts)
-        } if (audio_pts - 0.5).abs() < 0.001 && (video_pts - 1.0).abs() < 0.001
-    ));
 }
 
 #[test]

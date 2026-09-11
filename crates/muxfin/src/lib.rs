@@ -48,10 +48,15 @@
 //! # }
 //! ```
 
+#![forbid(unsafe_code)]
+
 mod muxer;
 
 // Re-export the API module so users can simply `use muxfin::api::...`.
 pub mod api;
+
+// Integer timestamp primitives (verdict §3): Timescale/SampleTime/EncodedSample.
+pub mod time;
 
 // Fragmented MP4 support for streaming applications
 pub mod fragmented;

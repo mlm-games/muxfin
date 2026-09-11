@@ -124,6 +124,20 @@ enum Commands {
         /// Validate inputs without creating output file
         #[arg(long)]
         dry_run: bool,
+
+        /// Explicit JSON manifest (verdict §12): sample paths with integer
+        /// pts/dts/duration in track timescale. When set, Annex-B splitting
+        /// is bypassed; each sample file is one access unit.
+        #[arg(long)]
+        manifest: Option<PathBuf>,
+
+        /// Overwrite output if it exists (otherwise error).
+        #[arg(long)]
+        overwrite: bool,
+
+        /// Validate only: check manifest/samples, write nothing.
+        #[arg(long)]
+        validate_only: bool,
     },
 
     /// Validate frame data without muxing
@@ -232,6 +246,283 @@ impl ProgressReporter {
     }
 }
 
+/// Explicit manifest schema (verdict §12). Each sample file is exactly one
+/// access unit; no Annex-B heuristics are applied.
+#[derive(Debug, serde::Deserialize)]
+struct Manifest {
+    timescale: u32,
+    video: Option<ManifestVideo>,
+    audio: Option<ManifestAudio>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ManifestVideo {
+    codec: String,
+    width: u32,
+    height: u32,
+    #[serde(default = "default_timescale_90k")]
+    timescale: u32,
+    samples: Vec<ManifestSample>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ManifestAudio {
+    codec: String,
+    sample_rate: u32,
+    channels: u16,
+    #[serde(default = "default_timescale_48k")]
+    timescale: u32,
+    samples: Vec<ManifestSample>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ManifestSample {
+    path: PathBuf,
+    pts: i64,
+    dts: i64,
+    duration: u32,
+    #[serde(default)]
+    keyframe: bool,
+}
+
+fn default_timescale_90k() -> u32 {
+    90_000
+}
+
+fn default_timescale_48k() -> u32 {
+    48_000
+}
+
+fn manifest_rescale(
+    value: i64,
+    from: muxfin::time::Timescale,
+    to: muxfin::time::Timescale,
+) -> anyhow::Result<i64> {
+    let num = (value as i128)
+        .checked_mul(to.get() as i128)
+        .ok_or_else(|| anyhow::anyhow!("timestamp overflow"))?;
+    let den = from.get() as i128;
+    let q = num.div_euclid(den);
+    let r = num.rem_euclid(den);
+    let rounded = if r * 2 >= den { q + 1 } else { q };
+    i64::try_from(rounded).map_err(|_| anyhow::anyhow!("timestamp overflow"))
+}
+
+/// Manifest mux path: integer timestamps, explicit durations, atomic output.
+fn mux_manifest_command(
+    manifest_path: &PathBuf,
+    output: &PathBuf,
+    overwrite: bool,
+    validate_only: bool,
+    verbose: bool,
+    json: bool,
+) -> Result<()> {
+    use muxfin::time::{EncodedSample, SampleTime, Timescale};
+
+    let raw = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("reading manifest {}", manifest_path.display()))?;
+    let manifest: Manifest = serde_json::from_str(&raw).with_context(|| "parsing manifest JSON")?;
+    if manifest.timescale == 0 {
+        anyhow::bail!("manifest timescale must be non-zero");
+    }
+    let video_cfg = manifest.video.as_ref();
+    let audio_cfg = manifest.audio.as_ref();
+    if video_cfg.is_none() && audio_cfg.is_none() {
+        anyhow::bail!("manifest must contain video and/or audio");
+    }
+    if output.exists() && !overwrite && !validate_only {
+        anyhow::bail!(
+            "output {} exists (use --overwrite to replace)",
+            output.display()
+        );
+    }
+    // Validate samples first (paths, non-empty, duration > 0, dts order).
+    let mut video_blobs: Vec<(ManifestSample, Vec<u8>)> = Vec::new();
+    if let Some(v) = video_cfg {
+        let mut prev_dts: Option<i64> = None;
+        for s in &v.samples {
+            if s.duration == 0 {
+                anyhow::bail!("video sample {} has zero duration", s.path.display());
+            }
+            if s.pts < 0 || s.dts < 0 {
+                anyhow::bail!("video sample {} has negative timestamp", s.path.display());
+            }
+            if let Some(prev) = prev_dts {
+                if s.dts <= prev {
+                    anyhow::bail!("video DTS must strictly increase");
+                }
+            }
+            prev_dts = Some(s.dts);
+            let blob = std::fs::read(&s.path)
+                .with_context(|| format!("reading sample {}", s.path.display()))?;
+            if blob.is_empty() {
+                anyhow::bail!("video sample {} is empty", s.path.display());
+            }
+            video_blobs.push((
+                ManifestSample {
+                    path: s.path.clone(),
+                    pts: s.pts,
+                    dts: s.dts,
+                    duration: s.duration,
+                    keyframe: s.keyframe,
+                },
+                blob,
+            ));
+        }
+    }
+    let mut audio_blobs: Vec<(ManifestSample, Vec<u8>)> = Vec::new();
+    if let Some(a) = audio_cfg {
+        let mut prev_dts: Option<i64> = None;
+        for s in &a.samples {
+            if s.duration == 0 {
+                anyhow::bail!("audio sample {} has zero duration", s.path.display());
+            }
+            if s.pts < 0 {
+                anyhow::bail!("audio sample {} has negative timestamp", s.path.display());
+            }
+            if let Some(prev) = prev_dts {
+                if s.dts < prev {
+                    anyhow::bail!("audio DTS must not decrease");
+                }
+            }
+            prev_dts = Some(s.dts);
+            let blob = std::fs::read(&s.path)
+                .with_context(|| format!("reading sample {}", s.path.display()))?;
+            if blob.is_empty() {
+                anyhow::bail!("audio sample {} is empty", s.path.display());
+            }
+            audio_blobs.push((
+                ManifestSample {
+                    path: s.path.clone(),
+                    pts: s.pts,
+                    dts: s.dts,
+                    duration: s.duration,
+                    keyframe: true,
+                },
+                blob,
+            ));
+        }
+    }
+    if validate_only {
+        let report = serde_json::json!({
+            "valid": true,
+            "video_samples": video_blobs.len(),
+            "audio_samples": audio_blobs.len(),
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    // Atomic output: temp file in same dir + rename; remove partial on failure.
+    let tmp = output.with_extension("tmp-muxfin");
+    let result: Result<()> = (|| {
+        let out = File::create(&tmp)
+            .with_context(|| format!("creating temp output {}", tmp.display()))?;
+        let mut builder = MuxerBuilder::new(out);
+        if let Some(v) = video_cfg {
+            let codec: VideoCodec = v.codec.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            // fps is informational only; timescale is truth.
+            builder = builder.video(codec, v.width, v.height, 30.0);
+        }
+        if let Some(a) = audio_cfg {
+            let codec: AudioCodec = a.codec.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            builder = builder.audio(codec, a.sample_rate, a.channels);
+        }
+        if let Some(t) = manifest.title.clone() {
+            builder = builder.with_metadata(Metadata::new().with_title(t));
+        }
+        let mut muxer = builder.build()?;
+        // Interleave by DTS in manifest timescale.
+        let vts = video_cfg.map(|v| v.timescale.max(1)).unwrap_or(90_000);
+        let ats = audio_cfg.map(|a| a.timescale.max(1)).unwrap_or(48_000);
+        let mut vi = 0usize;
+        let mut ai = 0usize;
+        while vi < video_blobs.len() || ai < audio_blobs.len() {
+            let take_video = match (video_blobs.get(vi), audio_blobs.get(ai)) {
+                (Some((s, _)), Some((a, _))) => {
+                    // Compare in common 90kHz-ish domain via cross-multiplication.
+                    (s.dts as i128 * ats as i128) <= (a.dts as i128 * vts as i128)
+                }
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if take_video {
+                let (s, blob) = &video_blobs[vi];
+                let timing = SampleTime::new(s.pts, s.dts, s.duration)?;
+                // Rescale manifest-track ticks into the muxer's track
+                // timescale (video 90k). SampleTime is track-relative, so
+                // convert here when they differ.
+                let (pts, dts, dur) = if vts == 90_000 {
+                    (s.pts, s.dts, s.duration)
+                } else {
+                    let from = Timescale::new(core::num::NonZeroU32::new(vts).unwrap());
+                    let to = Timescale::new(core::num::NonZeroU32::new(90_000).unwrap());
+                    (
+                        manifest_rescale(s.pts, from, to)?,
+                        manifest_rescale(s.dts, from, to)?,
+                        manifest_rescale(s.duration as i64, from, to)? as u32,
+                    )
+                };
+                let _ = timing;
+                muxer.write_video_sample(EncodedSample {
+                    data: blob,
+                    timing: SampleTime::new(pts, dts, dur)?,
+                    is_sync: s.keyframe,
+                })?;
+                vi += 1;
+            } else {
+                let (s, blob) = &audio_blobs[ai];
+                let track_ts = audio_cfg.map(|a| a.sample_rate).unwrap_or(48_000);
+                let (pts, dur) = if ats == track_ts {
+                    (s.pts, s.duration)
+                } else {
+                    let from = Timescale::new(core::num::NonZeroU32::new(ats).unwrap());
+                    let to = Timescale::new(core::num::NonZeroU32::new(track_ts.max(1)).unwrap());
+                    (
+                        manifest_rescale(s.pts, from, to)?,
+                        manifest_rescale(s.duration as i64, from, to)? as u32,
+                    )
+                };
+                muxer.write_audio_sample(EncodedSample {
+                    data: blob,
+                    timing: SampleTime::new(pts, pts, dur)?,
+                    is_sync: true,
+                })?;
+                ai += 1;
+            }
+        }
+        let stats = muxer.finish_with_stats()?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "video_frames": stats.video_frames,
+                    "audio_frames": stats.audio_frames,
+                    "bytes_written": stats.bytes_written,
+                }))?
+            );
+        } else if verbose {
+            eprintln!(
+                "muxed {} video + {} audio samples",
+                stats.video_frames, stats.audio_frames
+            );
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            std::fs::rename(&tmp, output)
+                .with_context(|| format!("renaming {} to {}", tmp.display(), output.display()))?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -259,8 +550,15 @@ fn main() -> Result<()> {
             language,
             creation_time,
             dry_run,
+            manifest,
+            overwrite,
+            validate_only,
         } => {
-            let progress = ProgressReporter::new(!cli.no_progress);
+            // Progress only when stderr is a terminal (verdict §12); machine
+            // output goes to stdout, diagnostics to stderr.
+            use std::io::IsTerminal as _;
+            let progress_enabled = !cli.no_progress && !cli.json && std::io::stderr().is_terminal();
+            let progress = ProgressReporter::new(progress_enabled);
             mux_command(
                 video,
                 audio,
@@ -279,6 +577,9 @@ fn main() -> Result<()> {
                 language,
                 creation_time,
                 dry_run,
+                manifest,
+                overwrite,
+                validate_only,
                 progress,
                 cli.verbose,
                 cli.json,
@@ -314,12 +615,34 @@ fn mux_command(
     language: Option<String>,
     creation_time: Option<String>,
     dry_run: bool,
+    manifest: Option<PathBuf>,
+    overwrite: bool,
+    validate_only: bool,
     mut progress: ProgressReporter,
     verbose: bool,
     json: bool,
 ) -> Result<()> {
+    // Manifest mode bypasses Annex-B heuristics entirely (verdict §12).
+    if let Some(manifest_path) = manifest {
+        return mux_manifest_command(
+            &manifest_path,
+            &output,
+            overwrite,
+            validate_only,
+            verbose,
+            json,
+        );
+    }
     if verbose {
         eprintln!("Setting up muxer...");
+    }
+
+    // Refuse to clobber without --overwrite; atomic rename on success.
+    if output.exists() && !overwrite && !dry_run {
+        anyhow::bail!(
+            "output {} exists (use --overwrite to replace)",
+            output.display()
+        );
     }
 
     // Validate required parameters

@@ -120,6 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         height: 480,
         timescale: 90_000,
         fragment_duration_ms: 1000,
+        boundary: muxfin::api::SegmentBoundary::Manual,
         sps: avc.sps,
         pps: avc.pps,
         vps: None,

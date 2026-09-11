@@ -40,16 +40,28 @@ pub mod nal_type {
 /// avcC box in MP4 containers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvcConfig {
-    /// Sequence Parameter Set NAL unit (without start code)
+    /// First Sequence Parameter Set (compat; original bytes, no start code).
     pub sps: Vec<u8>,
-    /// Picture Parameter Set NAL unit (without start code)
+    /// First Picture Parameter Set (compat; original bytes, no start code).
     pub pps: Vec<u8>,
+    /// All Sequence Parameter Sets (verdict §8; first entry == `sps`).
+    pub sequence_parameter_sets: Vec<Vec<u8>>,
+    /// All Picture Parameter Sets (verdict §8; first entry == `pps`).
+    pub picture_parameter_sets: Vec<Vec<u8>>,
+    /// NAL length size for AVCC (always 4 in muxfin output).
+    pub nal_length_size: u8,
 }
 
 impl AvcConfig {
     /// Create a new AVC configuration from SPS and PPS data.
     pub fn new(sps: Vec<u8>, pps: Vec<u8>) -> Self {
-        Self { sps, pps }
+        Self {
+            sequence_parameter_sets: vec![sps.clone()],
+            picture_parameter_sets: vec![pps.clone()],
+            sps,
+            pps,
+            nal_length_size: 4,
+        }
     }
 
     /// Extract profile_idc from the SPS.
@@ -69,6 +81,22 @@ impl AvcConfig {
     /// Level indicates max bitrate/resolution (31 = level 3.1 = 720p30).
     pub fn level_idc(&self) -> u8 {
         self.sps.get(3).copied().unwrap_or(31)
+    }
+
+    /// Caller-supplied multi-SPS/PPS config (verdict §8).
+    pub fn from_arrays(sps_list: Vec<Vec<u8>>, pps_list: Vec<Vec<u8>>) -> Option<Self> {
+        let sps = sps_list.first()?.clone();
+        let pps = pps_list.first()?.clone();
+        if sps.is_empty() || pps.is_empty() {
+            return None;
+        }
+        Some(Self {
+            sps,
+            pps,
+            sequence_parameter_sets: sps_list,
+            picture_parameter_sets: pps_list,
+            nal_length_size: 4,
+        })
     }
 }
 
@@ -118,12 +146,17 @@ pub fn extract_avc_config(data: &[u8]) -> Option<AvcConfig> {
         return None;
     }
 
-    let mut sps: Option<&[u8]> = None;
-    let mut pps: Option<&[u8]> = None;
+    let mut sps_list: Vec<Vec<u8>> = Vec::new();
+    let mut pps_list: Vec<Vec<u8>> = Vec::new();
 
     for nal in AnnexBNalIter::new(data) {
+        // Empty splits from consecutive start codes carry no NAL; skip.
         if nal.is_empty() {
             continue;
+        }
+        // Verdict §8: forbidden_zero_bit must be 0 (top bit of NAL header).
+        if nal[0] & 0x80 != 0 {
+            return None;
         }
 
         let nal_type = nal[0] & 0x1f;
@@ -135,30 +168,22 @@ pub fn extract_avc_config(data: &[u8]) -> Option<AvcConfig> {
             "codec::h264::extract_avc_config"
         );
 
-        if nal_type == nal_type::SPS && sps.is_none() {
-            sps = Some(nal);
-        } else if nal_type == nal_type::PPS && pps.is_none() {
-            pps = Some(nal);
-        }
-
-        // Early exit once we have both
-        if sps.is_some() && pps.is_some() {
-            break;
+        if nal_type == nal_type::SPS {
+            sps_list.push(nal.to_vec());
+        } else if nal_type == nal_type::PPS {
+            pps_list.push(nal.to_vec());
         }
     }
 
     // INV-302: Both SPS and PPS must be found for valid config
-    if let (Some(sps_data), Some(pps_data)) = (sps, pps) {
+    if !sps_list.is_empty() && !pps_list.is_empty() {
         assert_invariant!(
-            !sps_data.is_empty() && !pps_data.is_empty(),
+            true,
             "INV-302: H.264 SPS and PPS must be non-empty",
             "codec::h264::extract_avc_config"
         );
 
-        Some(AvcConfig {
-            sps: sps_data.to_vec(),
-            pps: pps_data.to_vec(),
-        })
+        AvcConfig::from_arrays(sps_list, pps_list)
     } else {
         None
     }
@@ -168,10 +193,7 @@ pub fn extract_avc_config(data: &[u8]) -> Option<AvcConfig> {
 ///
 /// Returns a valid configuration for 1080p @ High Profile, Level 4.0.
 pub fn default_avc_config() -> AvcConfig {
-    AvcConfig {
-        sps: DEFAULT_SPS.to_vec(),
-        pps: DEFAULT_PPS.to_vec(),
-    }
+    AvcConfig::new(DEFAULT_SPS.to_vec(), DEFAULT_PPS.to_vec())
 }
 
 /// Convert Annex B formatted data to AVCC (length-prefixed) format.
