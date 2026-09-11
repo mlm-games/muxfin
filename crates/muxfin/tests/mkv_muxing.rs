@@ -49,9 +49,14 @@ fn build_opus_packet() -> Vec<u8> {
     vec![0x24, 0xc0, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05]
 }
 
-/// Minimal VP9 keyframe with a valid frame header (100x100).
+/// Minimal VP9 keyframe with a spec-compliant uncompressed header (100x100).
+///
+/// Bit layout (MSB-first): frame_marker=0b10, profile=0,
+/// show_existing_frame=0, frame_type=0 (KEY), show_frame=1,
+/// error_resilient=0, sync_code=0x498342, color_space=1 (BT.601),
+/// studio range, 4:2:0, width-1/height-1 as u16.
 fn build_vp9_keyframe() -> Vec<u8> {
-    let mut data = vec![0x49, 0x83, 0x42, 0x00, 0x80, 0x64, 0x64, 0x12];
+    let mut data = vec![0x82, 0x49, 0x83, 0x42, 0x20, 0x06, 0x30, 0x06, 0x30];
     data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
     data
 }

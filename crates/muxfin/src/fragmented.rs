@@ -34,6 +34,7 @@
 //! ```
 
 // No imports needed currently - pure Vec-based API
+use crate::codec::vp9::vpcc_payload;
 
 /// Errors that can occur during fragmented MP4 muxing.
 #[derive(Debug, Clone, PartialEq)]
@@ -700,17 +701,11 @@ fn build_vp09_fmp4(config: &FragmentConfig) -> Vec<u8> {
 }
 
 fn build_vpcc_fmp4(config: &FragmentConfig) -> Vec<u8> {
-    let mut payload = Vec::new();
-    if let Some(vp9_config) = &config.vp9_config {
-        payload.push(1); // version
-        payload.push(vp9_config.profile); // profile
-        payload.push(vp9_config.level); // level
-        payload.push(vp9_config.bit_depth); // bit_depth
-        payload.push(vp9_config.color_space); // color_space
-        payload.push(vp9_config.transfer_function); // transfer_function
-        payload.push(vp9_config.matrix_coefficients); // matrix_coefficients
-        payload.push(vp9_config.full_range_flag); // full_range_flag
-    }
+    let payload = config
+        .vp9_config
+        .as_ref()
+        .map(vpcc_payload)
+        .unwrap_or_default();
     build_box(b"vpcC", &payload)
 }
 

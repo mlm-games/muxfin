@@ -3,69 +3,40 @@ mod support;
 use muxfin::api::{MuxerBuilder, VideoCodec};
 use support::SharedBuffer;
 
-/// Build a minimal VP9 keyframe with valid frame header.
+/// Build a minimal VP9 keyframe with a spec-compliant uncompressed header.
 ///
-/// This creates a synthetic VP9 frame with:
-/// - Valid frame marker (0x49 0x83 0x42)
-/// - Profile 0, keyframe, 100x100 resolution
-/// - 8-bit color depth, BT.709 color space
+/// Bit layout (MSB-first) per the VP9 bitstream specification:
+/// frame_marker=0b10, profile=0, show_existing_frame=0, frame_type=0 (KEY),
+/// show_frame=1, error_resilient=0, sync_code=0x498342, color_space=1 (BT.601),
+/// studio range, 4:2:0, width-1/height-1 as u16, render size = frame size.
 fn build_vp9_keyframe() -> Vec<u8> {
-    let mut data = Vec::new();
-
-    // VP9 frame marker
-    data.extend_from_slice(&[0x49, 0x83, 0x42]);
-
-    // Frame header byte 0: profile=0, show_existing_frame=0, frame_type=0 (keyframe)
-    data.push(0x00);
-
-    // Frame header byte 1: show_frame=1, error_resilient_mode=0
-    data.push(0x80);
-
-    // Frame width (100) as LEB128
-    // 100 = 0x64, LEB128: [0x64]
-    data.push(0x64);
-
-    // Frame height (100) as LEB128
-    // 100 = 0x64, LEB128: [0x64]
-    data.push(0x64);
-
-    // Render size same as frame size (bit 2 = 0)
-    // Color config: bit_depth=8, color_space=1 (BT.709), transfer_function=1, matrix_coefficients=1
-    data.push(0x12); // 0001 0010: bit_depth=8, color_space=1, transfer=0, matrix=0
-
-    // Minimal frame data (just enough to make it a valid frame)
+    // 100x100, profile 0. Bytes derived from the bit layout above
+    // (verified against the moq-mux 320x240 golden vector construction).
+    let mut data = vec![0x82, 0x49, 0x83, 0x42, 0x20, 0x06, 0x30, 0x06, 0x30];
+    // Minimal compressed payload (opaque to the muxer).
     data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-
     data
 }
 
-/// Build a minimal VP9 P-frame (inter frame).
+/// Build a minimal VP9 inter frame.
 ///
-/// This creates a synthetic VP9 P-frame with:
-/// - Valid frame marker
-/// - Frame type = 1 (inter frame)
-/// - References the previous keyframe
+/// `0x84` = marker `0b10`, profile 0, show_existing_frame=0,
+/// frame_type=1 (INTER), show_frame=0, error_resilient=0.
 fn build_vp9_pframe() -> Vec<u8> {
-    let mut data = Vec::new();
-
-    // VP9 frame marker
-    data.extend_from_slice(&[0x49, 0x83, 0x42]);
-
-    // Frame header byte 0: profile=0, show_existing_frame=0, frame_type=1 (inter)
-    data.push(0x10);
-
-    // Frame header byte 1: show_frame=1, error_resilient_mode=0
-    data.push(0x80);
-
-    // Minimal frame data for P-frame
-    data.extend_from_slice(&[0x00, 0x00]);
-
-    data
+    vec![0x84, 0x00, 0x00, 0x00]
 }
 
 /// Recursively search for a 4CC in an MP4 container by pattern matching
 fn contains_box(data: &[u8], fourcc: &[u8; 4]) -> bool {
     data.windows(4).any(|window| window == fourcc)
+}
+
+/// Locate a box payload: returns (size, payload_offset) of first occurrence.
+fn find_box(data: &[u8], fourcc: &[u8; 4]) -> Option<(u32, usize)> {
+    data.windows(4).position(|w| w == fourcc).and_then(|pos| {
+        let size = u32::from_be_bytes(data[pos - 4..pos].try_into().ok()?);
+        Some((size, pos + 4))
+    })
 }
 
 #[test]
@@ -96,7 +67,7 @@ fn vp9_keyframe_must_have_valid_config() {
         .build()
         .unwrap();
 
-    // Try to write an invalid VP9 frame (wrong marker)
+    // Try to write an invalid VP9 frame (bad frame marker: 00, not 0b10)
     let invalid_frame = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     let result = muxer.write_video(0.0, &invalid_frame, true);
     assert!(result.is_err());
@@ -133,7 +104,7 @@ fn vp9_muxer_produces_vp09_sample_entry() {
 }
 
 #[test]
-fn vp9_muxer_produces_vpcc_config_box() {
+fn vp9_muxer_produces_spec_compliant_vpcc() {
     let (writer, buffer) = SharedBuffer::new();
     let mut muxer = MuxerBuilder::new(writer)
         .video(VideoCodec::Vp9, 100, 100, 30.0)
@@ -147,9 +118,26 @@ fn vp9_muxer_produces_vpcc_config_box() {
     // Finalize
     muxer.finish().unwrap();
 
-    // Check output contains vpcC configuration box
+    // Check output contains vpcC configuration box with the binding layout:
+    // FullBox(version=1, flags=0) + profile + level +
+    // packed(bitDepth/chroma/fullRange) + primaries + transfer + matrix +
+    // codecInitDataSize(u16)=0  => 12-byte payload.
     let output = buffer.lock().unwrap();
-    assert!(contains_box(&output, b"vpcC"));
+    let (size, payload_off) = find_box(&output, b"vpcC").expect("vpcC present");
+    assert_eq!(size, 8 + 12, "vpcC box must be 20 bytes total");
+    let payload = &output[payload_off..payload_off + 12];
+    // FullBox header
+    assert_eq!(&payload[0..4], &[1, 0, 0, 0]);
+    // profile 0
+    assert_eq!(payload[4], 0);
+    // level: 100x100 -> picture-size lower bound L1.0 = 10
+    assert_eq!(payload[5], 10);
+    // bitDepth=8, chroma=1 (4:2:0), fullRange=0 -> 0x82
+    assert_eq!(payload[6], 0x82);
+    // BT.601 mapping: primaries=5, transfer=6, matrix=5
+    assert_eq!(&payload[7..10], &[5, 6, 5]);
+    // codecInitializationDataSize = 0
+    assert_eq!(&payload[10..12], &[0, 0]);
 }
 
 #[test]
@@ -163,7 +151,11 @@ fn vp9_config_extraction_works() {
     assert_eq!(config.height, 100);
     assert_eq!(config.profile, 0);
     assert_eq!(config.bit_depth, 8);
-    assert_eq!(config.color_space, 1); // BT.709
+    assert_eq!(config.chroma_subsampling, 1); // 4:2:0
+    assert_eq!(config.video_full_range_flag, 0);
+    assert_eq!(config.colour_primaries, 5); // BT.601
+    assert_eq!(config.transfer_characteristics, 6);
+    assert_eq!(config.matrix_coefficients, 5);
 }
 
 #[test]
@@ -175,4 +167,16 @@ fn vp9_keyframe_detection_works() {
 
     let pframe = build_vp9_pframe();
     assert!(!is_vp9_keyframe(&pframe).unwrap());
+}
+
+#[test]
+fn vp9_rejects_legacy_fake_marker_prefix() {
+    // Regression test for the outdated assumption that frames start with
+    // the sync-code bytes 0x49 0x83 0x42: those bits decode as frame
+    // marker 01, which is invalid. Real keyframes start with 0x82.
+    use muxfin::codec::vp9::{is_valid_vp9_frame, is_vp9_keyframe};
+
+    let fake = [0x49, 0x83, 0x42, 0x00, 0x00, 0x00];
+    assert!(is_vp9_keyframe(&fake).is_err());
+    assert!(!is_valid_vp9_frame(&fake));
 }

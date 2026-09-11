@@ -179,12 +179,13 @@ fn test_fragmented_vp9_basic() {
         width: 1920,
         height: 1080,
         profile: 0,
+        level: 40,
         bit_depth: 8,
-        color_space: 0,
-        transfer_function: 0,
-        matrix_coefficients: 0,
-        level: 0,
-        full_range_flag: 0,
+        chroma_subsampling: 1,
+        video_full_range_flag: 0,
+        colour_primaries: 1,
+        transfer_characteristics: 1,
+        matrix_coefficients: 1,
     };
 
     let config = FragmentConfig {
@@ -209,8 +210,9 @@ fn test_fragmented_vp9_basic() {
     // Should contain vp09 box for VP9
     assert!(init.windows(4).any(|w| w == b"vp09"));
 
-    // Add samples
-    let data = vec![0x49, 0x83, 0x42, 0x00, 0x00, 0x00]; // Fake VP9 keyframe (frame marker + minimal header)
+    // Add samples (real-shape VP9 keyframe header: marker 0b10, profile 0,
+    // KEY_FRAME, sync 0x498342; payload bytes are opaque to the muxer)
+    let data = vec![0x82, 0x49, 0x83, 0x42, 0x20, 0x06, 0x30, 0x06, 0x30];
     muxer.write_video(0, 0, &data, true).unwrap();
     muxer.write_video(3000, 3000, &data, false).unwrap();
 

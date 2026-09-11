@@ -441,10 +441,10 @@ mod contract_tests {
     fn contract_vp9_config_extraction() {
         clear_invariant_log();
 
-        // Create minimal VP9 keyframe data
+        // Real-shape VP9 keyframe: marker 0b10, profile 0, KEY_FRAME,
+        // sync 0x498342, BT.601 / studio / 4:2:0, 100x100.
         let vp9_data = vec![
-            0x49, 0x83, 0x42, // Frame marker
-            0x00, 0x00, 0x00, // Profile=0, show_existing=0, frame_type=0
+            0x82, 0x49, 0x83, 0x42, 0x20, 0x06, 0x30, 0x06, 0x30, 0x00, 0x00, 0x00, 0x00,
         ];
 
         // Call extract_vp9_config directly to trigger invariants
@@ -454,7 +454,7 @@ mod contract_tests {
         contract_test(
             "codec::vp9::extract_vp9_config",
             &[
-                "INV-401: VP9 frame marker must be 0x49 0x83 0x42",
+                "INV-401: VP9 frame marker must be 0b10",
                 "INV-402: VP9 profile must be valid (0-3)",
             ],
         );

@@ -1,46 +1,99 @@
 //! VP9 video codec support for MP4 muxing.
 //!
-//! This module provides VP9 frame parsing and configuration extraction
-//! for MP4 container muxing. VP9 frames are expected in their compressed
-//! form with frame headers intact.
+//! Parsing follows the VP9 bitstream specification ("VP9 Bitstream
+//! Superframe and Uncompressed Header", webmproject.org) and the
+//! container binding follows "VP Codec ISO Media File Format Binding"
+//! (`https://www.webmproject.org/vp9/mp4/`).
+//!
+//! # Bitstream notes
+//!
+//! A VP9 frame begins with an **uncompressed header** that is parsed
+//! MSB-first at the *bit* level (not byte-aligned):
+//!
+//! ```text
+//! frame_marker         f(2)  == 0b10
+//! profile_low          u(1)
+//! profile_high         u(1)  -> profile = (high << 1) | low
+//! [reserved_zero       f(1)  == 0, only if profile == 3]
+//! show_existing_frame  u(1)  -> if 1: frame_to_show u(3), end of header
+//! frame_type           u(1)  -> 0 = KEY_FRAME, 1 = INTER_FRAME
+//! show_frame           u(1)
+//! error_resilient_mode u(1)
+//! if KEY_FRAME:
+//!   sync_code          u(24) == 0x498342
+//!   color_config       (profile-dependent, see below)
+//!   frame_width_minus_1  u(16)  -> width = value + 1
+//!   frame_height_minus_1 u(16)  -> height = value + 1
+//!   render_and_frame_size_different u(1)
+//!   [render_width_minus_1 u(16), render_height_minus_1 u(16)]
+//! ```
+//!
+//! The 3-byte sequence `0x49 0x83 0x42` is the **sync code**, which only
+//! appears *inside* a keyframe (after the first header bits), never at
+//! byte 0. Any parser that expects a frame to *start* with those bytes
+//! rejects every real-world VP9 frame (a typical keyframe starts with
+//! `0x82`, i.e. marker `10`, profile 0, `show_existing_frame = 0`,
+//! `frame_type = 0`).
+//!
+//! # Container notes
+//!
+//! Samples are stored as whole VP9 frames (superframes pass through
+//! opaquely; only the first frame header is inspected). The sample entry
+//! is `vp09` containing a FullBox `vpcC` (version 1):
+//!
+//! ```text
+//! version(8)=1, flags(24)=0
+//! profile(8), level(8)
+//! bitDepth(4) | chromaSubsampling(3) | videoFullRangeFlag(1)
+//! colourPrimaries(8), transferCharacteristics(8), matrixCoefficients(8)
+//! codecInitializationDataSize(16) = 0
+//! ```
 
 use crate::assert_invariant;
 
-/// VP9 codec configuration extracted from the first keyframe.
-#[derive(Clone, Debug, PartialEq)]
+/// VP9 key-frame sync code (`frame_sync_code`, u(24)).
+const SYNC_CODE: u32 = 0x49_83_42;
+
+/// Codec configuration carried in the MP4 `vpcC` box, plus the decoded
+/// picture size. Field names match the `VPCodecConfigurationRecord`
+/// semantics from the VP Codec ISO Media File Format Binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vp9Config {
-    /// Video width in pixels.
+    /// Decoded picture width in pixels (render size when present).
     pub width: u32,
-    /// Video height in pixels.
+    /// Decoded picture height in pixels (render size when present).
     pub height: u32,
     /// VP9 profile (0-3).
     pub profile: u8,
-    /// Bit depth (8 or 10).
-    pub bit_depth: u8,
-    /// Color space information.
-    pub color_space: u8,
-    /// Transfer characteristics.
-    pub transfer_function: u8,
-    /// Matrix coefficients.
-    pub matrix_coefficients: u8,
-    /// VP9 level (0-255, typically 0 for most content).
+    /// VP9 level (e.g. 10 = 1.0, 41 = 4.1). Picture-size lower bound
+    /// per Annex A when the true encode level is unknown.
     pub level: u8,
-    /// Video full range flag (0 = limited range, 1 = full range).
-    pub full_range_flag: u8,
+    /// Luma/chroma bit depth (8, 10 or 12).
+    pub bit_depth: u8,
+    /// Chroma subsampling: 0 = 4:4:0, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4.
+    pub chroma_subsampling: u8,
+    /// 0 = legal (studio) range, 1 = full range.
+    pub video_full_range_flag: u8,
+    /// CICP colour primaries.
+    pub colour_primaries: u8,
+    /// CICP transfer characteristics.
+    pub transfer_characteristics: u8,
+    /// CICP matrix coefficients (0 = RGB).
+    pub matrix_coefficients: u8,
 }
 
 /// Errors that can occur during VP9 parsing.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Vp9Error {
     /// Frame data is too short to contain a valid VP9 frame header.
     FrameTooShort,
-    /// Invalid frame marker (first 3 bytes should be 0x49, 0x83, 0x42).
+    /// First two bits are not the `0b10` frame marker.
     InvalidFrameMarker,
-    /// Unsupported VP9 profile.
-    UnsupportedProfile(u8),
-    /// Invalid bit depth.
-    InvalidBitDepth(u8),
-    /// Frame parsing error with details.
+    /// Profile-3 reserved bit was set.
+    InvalidReservedBit,
+    /// Keyframe sync code is not `0x498342`.
+    InvalidSyncCode,
+    /// Generic parse failure with details.
     ParseError(String),
 }
 
@@ -48,9 +101,13 @@ impl std::fmt::Display for Vp9Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Vp9Error::FrameTooShort => write!(f, "VP9 frame too short for header"),
-            Vp9Error::InvalidFrameMarker => write!(f, "invalid VP9 frame marker"),
-            Vp9Error::UnsupportedProfile(p) => write!(f, "unsupported VP9 profile: {}", p),
-            Vp9Error::InvalidBitDepth(b) => write!(f, "invalid VP9 bit depth: {}", b),
+            Vp9Error::InvalidFrameMarker => {
+                write!(f, "invalid VP9 frame marker (expected 0b10)")
+            }
+            Vp9Error::InvalidReservedBit => {
+                write!(f, "invalid VP9 reserved bit (profile 3 requires 0)")
+            }
+            Vp9Error::InvalidSyncCode => write!(f, "invalid VP9 sync code (expected 0x498342)"),
             Vp9Error::ParseError(msg) => write!(f, "VP9 parse error: {}", msg),
         }
     }
@@ -58,349 +115,489 @@ impl std::fmt::Display for Vp9Error {
 
 impl std::error::Error for Vp9Error {}
 
-/// Check if a VP9 frame is a keyframe (intra frame).
-///
-/// VP9 keyframes have frame_type = 0 in the frame header.
-pub fn is_vp9_keyframe(frame: &[u8]) -> Result<bool, Vp9Error> {
-    if frame.len() < 3 {
-        return Err(Vp9Error::FrameTooShort);
+/// MSB-first bit reader over a byte slice.
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_pos: 0 }
     }
 
-    // Check frame marker
-    if frame[0] != 0x49 || frame[1] != 0x83 || frame[2] != 0x42 {
+    fn remaining_bits(&self) -> usize {
+        self.data.len() * 8 - self.bit_pos
+    }
+
+    fn read(&mut self, n: u32) -> Result<u32, Vp9Error> {
+        if n > 32 {
+            return Err(Vp9Error::ParseError("read width > 32".into()));
+        }
+        if self.remaining_bits() < n as usize {
+            return Err(Vp9Error::FrameTooShort);
+        }
+        let mut value = 0u32;
+        for _ in 0..n {
+            let byte = self.data[self.bit_pos / 8];
+            // MSB-first: bit 0 of a byte is its high bit.
+            let bit = (byte >> (7 - (self.bit_pos % 8))) & 1;
+            value = (value << 1) | u32::from(bit);
+            self.bit_pos += 1;
+        }
+        Ok(value)
+    }
+
+    fn skip(&mut self, n: u32) -> Result<(), Vp9Error> {
+        self.read(n).map(|_| ())
+    }
+}
+
+/// What the uncompressed header told us (stops after the fields we need).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderKind {
+    ShowExisting { index: u8 },
+    Key,
+    Inter,
+}
+
+/// Parse frame marker / profile / show_existing_frame / frame_type.
+///
+/// Consumes only those bits; the caller continues for keyframes.
+fn parse_frame_prefix(r: &mut BitReader<'_>) -> Result<(u8, HeaderKind), Vp9Error> {
+    if r.read(2)? != 0b10 {
         return Err(Vp9Error::InvalidFrameMarker);
     }
-
-    if frame.len() < 4 {
-        return Err(Vp9Error::FrameTooShort);
-    }
-
-    // Parse frame header to determine frame type
-    let profile = (frame[3] >> 6) & 0x03;
-    let show_existing_frame = (frame[3] >> 5) & 0x01;
-    let frame_type = (frame[3] >> 4) & 0x01;
+    let profile_low = r.read(1)?;
+    let profile_high = r.read(1)?;
+    let profile = ((profile_high << 1) | profile_low) as u8;
 
     // INV-405: VP9 profile must be valid (0-3)
     assert_invariant!(
         profile <= 3,
         "VP9 profile must be valid (0-3)",
-        "codec::vp9::is_vp9_keyframe"
+        "codec::vp9::parse_frame_prefix"
     );
 
-    // If show_existing_frame is set, this is not a keyframe
-    if show_existing_frame != 0 {
-        return Ok(false);
+    if profile == 3 && r.read(1)? != 0 {
+        return Err(Vp9Error::InvalidReservedBit);
     }
+    if r.read(1)? == 1 {
+        let index = r.read(3)? as u8;
+        return Ok((profile, HeaderKind::ShowExisting { index }));
+    }
+    let frame_type = r.read(1)?;
+    r.skip(2)?; // show_frame, error_resilient_mode
+    if frame_type == 0 {
+        Ok((profile, HeaderKind::Key))
+    } else {
+        Ok((profile, HeaderKind::Inter))
+    }
+}
 
-    // frame_type = 0 indicates a keyframe
-    Ok(frame_type == 0)
+/// Check if a VP9 frame is a keyframe.
+///
+/// Parses the bit-level uncompressed header: `frame_marker == 0b10`,
+/// `show_existing_frame == 0` and `frame_type == 0` (KEY_FRAME).
+/// `show_existing_frame == 1` frames only reference a previously decoded
+/// frame and are never keyframes.
+pub fn is_vp9_keyframe(frame: &[u8]) -> Result<bool, Vp9Error> {
+    if frame.is_empty() {
+        return Err(Vp9Error::FrameTooShort);
+    }
+    let mut r = BitReader::new(frame);
+    let (_profile, kind) = parse_frame_prefix(&mut r)?;
+    match kind {
+        HeaderKind::Key => {
+            // A keyframe must still carry a valid sync code; reject
+            // truncated/corrupt headers instead of misclassifying them.
+            if r.remaining_bits() < 24 {
+                return Err(Vp9Error::FrameTooShort);
+            }
+            if r.read(24)? != SYNC_CODE {
+                return Err(Vp9Error::InvalidSyncCode);
+            }
+            Ok(true)
+        }
+        HeaderKind::ShowExisting { .. } | HeaderKind::Inter => Ok(false),
+    }
+}
+
+/// VP9 `color_space` enum values (spec section on color config).
+const CS_BT_601: u8 = 1;
+const CS_BT_709: u8 = 2;
+const CS_SMPTE_170: u8 = 3;
+const CS_SMPTE_240: u8 = 4;
+const CS_BT_2020: u8 = 5;
+const CS_RGB: u8 = 7;
+
+/// Color config decoded from a keyframe header.
+struct ColorConfig {
+    bit_depth: u8,
+    subsampling_x: bool,
+    subsampling_y: bool,
+    full_range: bool,
+    colour_primaries: u8,
+    transfer_characteristics: u8,
+    matrix_coefficients: u8,
+}
+
+/// Parse `color_config` for a keyframe of the given profile.
+fn parse_color_config(r: &mut BitReader<'_>, profile: u8) -> Result<ColorConfig, Vp9Error> {
+    // Bit depth: profiles 0/1 are always 8-bit; profiles 2/3 carry a
+    // ten_or_twelve_bit flag (0 = 10-bit, 1 = 12-bit).
+    let bit_depth = if profile >= 2 {
+        if r.read(1)? == 1 { 12 } else { 10 }
+    } else {
+        8
+    };
+
+    let color_space = r.read(3)? as u8;
+    let (subsampling_x, subsampling_y, full_range) = if color_space == CS_RGB {
+        // sRGB: full range, 4:4:4. Profiles 1/3 still carry a reserved
+        // zero bit here (libvpx `read_bitdepth_colorspace_sampling`).
+        if profile == 1 || profile == 3 {
+            if r.read(1)? != 0 {
+                return Err(Vp9Error::ParseError("VP9 reserved bit set".into()));
+            }
+        }
+        (false, false, true)
+    } else {
+        let full_range = r.read(1)? == 1;
+        if profile == 1 || profile == 3 {
+            let sx = r.read(1)? == 1;
+            let sy = r.read(1)? == 1;
+            r.skip(1)?; // reserved_zero
+            (sx, sy, full_range)
+        } else {
+            // Profiles 0/2 are always 4:2:0.
+            (true, true, full_range)
+        }
+    };
+
+    let (colour_primaries, transfer_characteristics, matrix_coefficients) =
+        cicp_for_color_space(color_space);
+
+    Ok(ColorConfig {
+        bit_depth,
+        subsampling_x,
+        subsampling_y,
+        full_range,
+        colour_primaries,
+        transfer_characteristics,
+        matrix_coefficients,
+    })
+}
+
+/// Lossy but deterministic mapping from the VP9 `color_space` enum to
+/// CICP (primaries/transfer/matrix). The VP9 header carries only this
+/// enum plus the range flag, so exact CICP values are unrecoverable;
+/// callers that know better should override the [`Vp9Config`] fields.
+fn cicp_for_color_space(color_space: u8) -> (u8, u8, u8) {
+    match color_space {
+        CS_BT_601 => (5, 6, 5),    // BT.470BG / BT.601-625
+        CS_BT_709 => (1, 1, 1),    // BT.709
+        CS_SMPTE_170 => (6, 6, 6), // SMPTE-170M
+        CS_SMPTE_240 => (7, 7, 7), // SMPTE-240M
+        CS_BT_2020 => (9, 14, 9),  // BT.2020, SDR transfer
+        CS_RGB => (2, 2, 0),       // RGB: matrix 0
+        _ => (2, 2, 2),            // UNKNOWN / RESERVED: unspecified
+    }
+}
+
+/// `vpcC` chroma-subsampling code from subsampling flags.
+fn chroma_subsampling(sx: bool, sy: bool) -> u8 {
+    match (sx, sy) {
+        (true, true) => 1,   // 4:2:0 colocated
+        (true, false) => 2,  // 4:2:2
+        (false, false) => 3, // 4:4:4
+        (false, true) => 0,  // 4:4:0 (rare)
+    }
+}
+
+/// Lowest VP9 level (Annex A) whose `MaxLumaPictureSize` fits
+/// `width * height`. Framerate/bitrate are unknown from the header, so
+/// this is a picture-size lower bound rather than the true encode level.
+fn level_for_resolution(width: u32, height: u32) -> u8 {
+    const LEVELS: [(u64, u8); 12] = [
+        (36_864, 10),
+        (73_728, 11),
+        (122_880, 20),
+        (245_760, 21),
+        (552_960, 30),
+        (983_040, 31),
+        (2_228_224, 40),
+        (3_342_336, 41),
+        (8_912_896, 50),
+        (8_912_896, 51),
+        (35_651_584, 60),
+        (35_651_584, 61),
+    ];
+    let pixels = u64::from(width) * u64::from(height);
+    for (max_pixels, level) in LEVELS {
+        if pixels <= max_pixels {
+            return level;
+        }
+    }
+    61
 }
 
 /// Extract VP9 configuration from a keyframe.
 ///
-/// This parses the uncompressed header of a VP9 keyframe to extract
-/// resolution and other configuration parameters.
+/// Parses the uncompressed header up to (and including) the render size.
+/// Returns `None` for non-keyframes (`show_existing_frame`, inter
+/// frames) or malformed input.
 pub fn extract_vp9_config(keyframe: &[u8]) -> Option<Vp9Config> {
-    if keyframe.len() < 3 {
+    if keyframe.is_empty() {
+        return None;
+    }
+    let mut r = BitReader::new(keyframe);
+    let (profile, kind) = parse_frame_prefix(&mut r).ok()?;
+    if kind != HeaderKind::Key {
         return None;
     }
 
-    // Check frame marker
-    if keyframe[0] != 0x49 || keyframe[1] != 0x83 || keyframe[2] != 0x42 {
-        return None;
-    }
-
-    // INV-401: VP9 frame marker must be valid
+    // INV-401: the frame marker occupies the first two bits (MSB-first),
+    // so it is the top two bits of byte 0. The prefix parse above only
+    // succeeds when they equal 0b10; assert on the raw bits directly.
+    let marker = (keyframe[0] >> 6) & 0x03;
     assert_invariant!(
-        keyframe[0] == 0x49 && keyframe[1] == 0x83 && keyframe[2] == 0x42,
-        "INV-401: VP9 frame marker must be 0x49 0x83 0x42",
+        marker == 0b10,
+        "INV-401: VP9 frame marker must be 0b10",
         "codec::vp9::extract_vp9_config"
     );
-
-    if keyframe.len() < 6 {
-        return None;
-    }
-
-    // Parse basic frame header fields
-    let profile = (keyframe[3] >> 6) & 0x03;
-    let show_existing_frame = (keyframe[3] >> 5) & 0x01;
-    let frame_type = (keyframe[3] >> 4) & 0x01;
-
-    // INV-402: VP9 profile must be valid (0-3)
+    // INV-402: profile is decoded from two bits, so it is always 0-3;
+    // assert on the real decoded value.
     assert_invariant!(
         profile <= 3,
         "INV-402: VP9 profile must be valid (0-3)",
         "codec::vp9::extract_vp9_config"
     );
 
-    if show_existing_frame != 0 || frame_type != 0 {
-        return None; // Not a keyframe
+    if r.read(24).ok()? != SYNC_CODE {
+        return None;
     }
 
-    // For keyframes, parse the frame size from the uncompressed header
-    // VP9 uses variable-length unsigned integer encoding for frame dimensions
+    let color = parse_color_config(&mut r, profile).ok()?;
 
-    let mut offset = 5; // Start after the frame header bytes
+    if r.remaining_bits() < 33 {
+        return None;
+    }
+    let width = r.read(16).ok()? + 1;
+    let height = r.read(16).ok()? + 1;
+    if width == 0 || height == 0 || width > 65535 || height > 65535 {
+        return None;
+    }
 
-    // Skip sync code if present (for certain profiles)
-    if profile >= 2 {
-        if offset + 1 >= keyframe.len() {
+    let (render_width, render_height) = if r.read(1).ok()? == 1 {
+        if r.remaining_bits() < 32 {
             return None;
         }
-        offset += 1; // Skip sync code byte
-    }
-
-    // Parse frame width (variable length unsigned int)
-    let (width, new_offset) = parse_vp9_var_uint(keyframe, offset)?;
-    offset = new_offset;
-
-    // Parse frame height (variable length unsigned int)
-    let (height, new_offset) = parse_vp9_var_uint(keyframe, offset)?;
-    offset = new_offset;
-
-    // Parse render size (optional, may differ from frame size)
-    let (render_width, render_height) = if offset + 1 < keyframe.len() {
-        let render_and_frame_size_different = (keyframe[offset] & 0x0C) != 0;
-        if render_and_frame_size_different {
-            offset += 1;
-            let (rw, no) = parse_vp9_var_uint(keyframe, offset)?;
-            offset = no;
-            let (rh, no) = parse_vp9_var_uint(keyframe, offset)?;
-            offset = no;
-            (rw, rh)
-        } else {
-            (width, height)
-        }
+        (r.read(16).ok()? + 1, r.read(16).ok()? + 1)
     } else {
         (width, height)
     };
-
-    // Parse color configuration
-    let (bit_depth, color_space, transfer_function, matrix_coefficients, full_range_flag) =
-        parse_vp9_color_config(keyframe, offset)?;
 
     Some(Vp9Config {
         width: render_width,
         height: render_height,
         profile,
-        bit_depth,
-        color_space,
-        transfer_function,
-        matrix_coefficients,
-        level: 0, // VP9 level is typically 0
-        full_range_flag,
+        level: level_for_resolution(render_width, render_height),
+        bit_depth: color.bit_depth,
+        chroma_subsampling: chroma_subsampling(color.subsampling_x, color.subsampling_y),
+        video_full_range_flag: u8::from(color.full_range),
+        colour_primaries: color.colour_primaries,
+        transfer_characteristics: color.transfer_characteristics,
+        matrix_coefficients: color.matrix_coefficients,
     })
 }
 
-/// Parse VP9 variable-length unsigned integer.
-/// Returns (value, new_offset) or None if parsing fails.
-fn parse_vp9_var_uint(data: &[u8], mut offset: usize) -> Option<(u32, usize)> {
-    let mut value = 0u32;
-    let mut shift = 0;
-
-    loop {
-        if offset >= data.len() {
-            return None;
-        }
-
-        let byte = data[offset];
-        offset += 1;
-
-        value |= ((byte & 0x7F) as u32) << shift;
-        shift += 7;
-
-        if (byte & 0x80) == 0 {
-            break;
-        }
-
-        if shift >= 32 {
-            return None; // Prevent overflow
-        }
-    }
-
-    Some((value, offset))
-}
-
-/// Parse VP9 color configuration from the frame header.
-/// Returns (bit_depth, color_space, transfer_function, matrix_coefficients, full_range_flag)
-fn parse_vp9_color_config(data: &[u8], mut offset: usize) -> Option<(u8, u8, u8, u8, u8)> {
-    if offset >= data.len() {
-        return Some((8, 0, 0, 0, 0)); // Default values
-    }
-
-    // Parse bit depth
-    let bit_depth = if (data[offset] & 0x01) != 0 { 10 } else { 8 };
-
-    // Parse color space and transfer characteristics
-    let color_space = (data[offset] >> 1) & 0x07;
-    let transfer_function = (data[offset] >> 4) & 0x07;
-    let matrix_coefficients = (data[offset] >> 7) & 0x01;
-
-    offset += 1;
-
-    // If color_space != 0, parse additional color config including full_range
-    let full_range_flag = if color_space != 0 {
-        if offset >= data.len() {
-            0 // Default to limited range if data missing
-        } else {
-            data[offset] & 0x01
-        }
-    } else {
-        0 // Limited range for monochrome
-    };
-
-    Some((
-        bit_depth,
-        color_space,
-        transfer_function,
-        matrix_coefficients,
-        full_range_flag,
-    ))
-}
-
-/// Validate that a buffer contains a valid VP9 frame.
+/// Build the 12-byte `vpcC` payload: FullBox header (version 1, flags 0)
+/// followed by the 8-byte `VPCodecConfigurationRecord` with
+/// `codecInitializationDataSize = 0` (mandatory zero for VP9).
 ///
-/// This performs basic validation of the VP9 frame structure.
+/// Shared by the MP4 and fragmented-MP4 writers so the box layout cannot
+/// drift between them.
+pub fn vpcc_payload(config: &Vp9Config) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(12);
+    // FullBox: version = 1, flags = 0.
+    payload.extend_from_slice(&[1, 0, 0, 0]);
+    payload.push(config.profile);
+    payload.push(config.level);
+    payload.push(
+        ((config.bit_depth & 0x0F) << 4)
+            | ((config.chroma_subsampling & 0x07) << 1)
+            | (config.video_full_range_flag & 0x01),
+    );
+    payload.push(config.colour_primaries);
+    payload.push(config.transfer_characteristics);
+    payload.push(config.matrix_coefficients);
+    // codecInitializationDataSize (u16) = 0 for VP9; no init data follows.
+    payload.extend_from_slice(&0u16.to_be_bytes());
+    payload
+}
+
+/// Validate that a buffer contains a plausible VP9 frame.
+///
+/// Accepts keyframes, inter frames and `show_existing_frame` headers;
+/// rejects bad markers and truncated headers.
 pub fn is_valid_vp9_frame(frame: &[u8]) -> bool {
-    if frame.len() < 3 {
+    if frame.is_empty() {
         return false;
     }
-
-    // Check frame marker
-    frame[0] == 0x49 && frame[1] == 0x83 && frame[2] == 0x42
+    let mut r = BitReader::new(frame);
+    let Ok((_profile, kind)) = parse_frame_prefix(&mut r) else {
+        return false;
+    };
+    match kind {
+        HeaderKind::ShowExisting { .. } | HeaderKind::Inter => true,
+        HeaderKind::Key => {
+            if r.remaining_bits() < 24 {
+                return false;
+            }
+            r.read(24).is_ok_and(|code| code == SYNC_CODE)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Real-shape VP9 keyframe: profile 0, show_frame, 8-bit, BT.601,
+    /// studio range, 4:2:0, 320x240. Bytes after the render-size flag are
+    /// irrelevant to the parser.
+    const KEYFRAME_320X240: &[u8] = &[0x82, 0x49, 0x83, 0x42, 0x20, 0x13, 0xF0, 0x0E, 0xF0, 0x00];
+
     #[test]
-    fn test_invalid_frame_marker() {
-        let invalid_frame = [0x00, 0x00, 0x00];
-        assert!(!is_valid_vp9_frame(&invalid_frame));
+    fn test_rejects_empty() {
+        assert!(matches!(is_vp9_keyframe(&[]), Err(Vp9Error::FrameTooShort)));
+        assert!(!is_valid_vp9_frame(&[]));
+        assert!(extract_vp9_config(&[]).is_none());
+    }
+
+    #[test]
+    fn test_rejects_bad_marker() {
+        // First two bits 00, not 0b10.
+        let bad = [0x00, 0x00, 0x00, 0x00];
         assert!(matches!(
-            is_vp9_keyframe(&invalid_frame),
+            is_vp9_keyframe(&bad),
             Err(Vp9Error::InvalidFrameMarker)
         ));
+        assert!(!is_valid_vp9_frame(&bad));
+        assert!(extract_vp9_config(&bad).is_none());
     }
 
     #[test]
-    fn test_frame_too_short() {
-        let short_frame = [0x49, 0x83];
-        assert!(!is_valid_vp9_frame(&short_frame));
+    fn test_rejects_old_style_fake_marker_prefix() {
+        // The outdated assumption was that frames *start* with the sync
+        // code bytes. Those bytes decode as marker 01 -> invalid.
+        let fake = [0x49, 0x83, 0x42, 0x00, 0x00, 0x00];
         assert!(matches!(
-            is_vp9_keyframe(&short_frame),
-            Err(Vp9Error::FrameTooShort)
+            is_vp9_keyframe(&fake),
+            Err(Vp9Error::InvalidFrameMarker)
         ));
+        assert!(!is_valid_vp9_frame(&fake));
     }
 
     #[test]
-    fn test_valid_frame_marker() {
-        let valid_frame = [0x49, 0x83, 0x42, 0x00, 0x00, 0x00];
-        assert!(is_valid_vp9_frame(&valid_frame));
-    }
-
-    #[test]
-    fn test_is_vp9_keyframe_valid() {
-        // Valid keyframe: profile=0, show_existing_frame=0, frame_type=0
-        let keyframe = [0x49, 0x83, 0x42, 0x00, 0x00, 0x00];
-        assert_eq!(is_vp9_keyframe(&keyframe), Ok(true));
-    }
-
-    #[test]
-    fn test_is_vp9_keyframe_pframe() {
-        // P-frame: profile=0, show_existing_frame=0, frame_type=1
-        let pframe = [0x49, 0x83, 0x42, 0x10, 0x00, 0x00];
-        assert_eq!(is_vp9_keyframe(&pframe), Ok(false));
-    }
-
-    #[test]
-    fn test_is_vp9_keyframe_show_existing() {
-        // Show existing frame: profile=0, show_existing_frame=1, frame_type=0
-        let show_existing = [0x49, 0x83, 0x42, 0x20, 0x00, 0x00];
-        assert_eq!(is_vp9_keyframe(&show_existing), Ok(false));
-    }
-
-    #[test]
-    fn test_extract_vp9_config_valid() {
-        // Minimal valid VP9 keyframe with config
-        let keyframe = vec![
-            0x49, 0x83, 0x42, // frame marker
-            0x00, // profile=0, show_existing=0, frame_type=0
-            0x00, // byte 4 (possibly part of header)
-            0x80, 0x02, // width = 256 (var_uint: starts at offset 5)
-            0x80, 0x02, // height = 256 (var_uint)
-            0x00, // render size same as frame size
-            0x00, // color config (8-bit, color_space=0)
-        ];
-        let config = extract_vp9_config(&keyframe);
-        assert!(config.is_some());
-        let config = config.unwrap();
-        assert_eq!(config.width, 256);
-        assert_eq!(config.height, 256);
+    fn test_parses_real_keyframe() {
+        assert_eq!(is_vp9_keyframe(KEYFRAME_320X240), Ok(true));
+        assert!(is_valid_vp9_frame(KEYFRAME_320X240));
+        let config = extract_vp9_config(KEYFRAME_320X240).expect("config");
+        assert_eq!(config.width, 320);
+        assert_eq!(config.height, 240);
         assert_eq!(config.profile, 0);
         assert_eq!(config.bit_depth, 8);
-        assert_eq!(config.level, 0);
-        assert_eq!(config.full_range_flag, 0);
+        assert_eq!(config.chroma_subsampling, 1);
+        assert_eq!(config.video_full_range_flag, 0);
+        assert_eq!(config.colour_primaries, 5);
+        assert_eq!(config.transfer_characteristics, 6);
+        assert_eq!(config.matrix_coefficients, 5);
+        assert_eq!(config.level, 20);
     }
 
     #[test]
-    fn test_extract_vp9_config_invalid_marker() {
-        let invalid_frame = [0x00, 0x00, 0x00, 0x00];
-        assert!(extract_vp9_config(&invalid_frame).is_none());
+    fn test_interframe_is_not_keyframe() {
+        // 0b10 marker, profile 0, show_existing 0, frame_type 1 (inter).
+        let inter = [0x84, 0x00, 0x00, 0x00];
+        assert_eq!(is_vp9_keyframe(&inter), Ok(false));
+        assert!(is_valid_vp9_frame(&inter));
+        assert!(extract_vp9_config(&inter).is_none());
     }
 
     #[test]
-    fn test_extract_vp9_config_pframe() {
-        // P-frame should not extract config
-        let pframe = [0x49, 0x83, 0x42, 0x10, 0x00, 0x00];
-        assert!(extract_vp9_config(&pframe).is_none());
+    fn test_show_existing_is_not_keyframe() {
+        // 0b10 marker, profile 0, show_existing 1, index 0.
+        let show_existing = [0x88, 0x00, 0x00, 0x00];
+        assert_eq!(is_vp9_keyframe(&show_existing), Ok(false));
+        assert!(is_valid_vp9_frame(&show_existing));
+        assert!(extract_vp9_config(&show_existing).is_none());
+    }
+
+    /// Real libvpx keyframe header (ffmpeg `testsrc` 320x240, profile 1,
+    /// sRGB): exercises the profile-1 reserved bit after `color_space = 7`.
+    /// Trailing bytes are the start of the compressed payload.
+    const LIBVPX_KEYFRAME_PREFIX: &[u8] = &[
+        0xa2, 0x49, 0x83, 0x42, 0xe0, 0x13, 0xf0, 0x0e, 0xf6, 0x0a, 0x38, 0x24, 0x1c, 0x18, 0x4a,
+        0x00,
+    ];
+
+    #[test]
+    fn test_parses_libvpx_profile1_srgb_keyframe() {
+        assert_eq!(is_vp9_keyframe(LIBVPX_KEYFRAME_PREFIX), Ok(true));
+        let config = extract_vp9_config(LIBVPX_KEYFRAME_PREFIX).expect("config");
+        assert_eq!((config.width, config.height), (320, 240));
+        assert_eq!(config.profile, 1);
+        assert_eq!(config.bit_depth, 8);
+        assert_eq!(config.chroma_subsampling, 3); // sRGB implies 4:4:4
+        assert_eq!(config.video_full_range_flag, 1);
+        assert_eq!(config.matrix_coefficients, 0); // RGB
     }
 
     #[test]
-    fn test_parse_vp9_var_uint() {
-        // Test parsing variable-length unsigned integers
-        let data = [0x7F, 0x80, 0x01, 0x80, 0x80, 0x01];
-
-        // Single byte: 0x7F = 127
-        assert_eq!(parse_vp9_var_uint(&data, 0), Some((127, 1)));
-
-        // Two bytes: 0x80 0x01 = 128
-        assert_eq!(parse_vp9_var_uint(&data, 1), Some((128, 3)));
-
-        // Three bytes: 0x80 0x80 0x01 = 16384
-        assert_eq!(parse_vp9_var_uint(&data, 3), Some((16384, 6)));
+    fn test_rejects_bad_sync_code() {
+        let mut bad_sync = KEYFRAME_320X240.to_vec();
+        bad_sync[1] = 0x00;
+        assert!(matches!(
+            is_vp9_keyframe(&bad_sync),
+            Err(Vp9Error::InvalidSyncCode)
+        ));
+        assert!(!is_valid_vp9_frame(&bad_sync));
+        assert!(extract_vp9_config(&bad_sync).is_none());
     }
 
     #[test]
-    fn test_parse_vp9_var_uint_overflow() {
-        // Test overflow prevention (more than 5 bytes would overflow u32)
-        let data = [0x80, 0x80, 0x80, 0x80, 0x80, 0x80]; // 6 continuation bytes
-        assert_eq!(parse_vp9_var_uint(&data, 0), None);
+    fn test_vpcc_payload_layout() {
+        let config = Vp9Config {
+            width: 320,
+            height: 240,
+            profile: 0,
+            level: 20,
+            bit_depth: 8,
+            chroma_subsampling: 1,
+            video_full_range_flag: 0,
+            colour_primaries: 1,
+            transfer_characteristics: 1,
+            matrix_coefficients: 1,
+        };
+        let payload = vpcc_payload(&config);
+        assert_eq!(payload, vec![1, 0, 0, 0, 0, 20, 0x82, 1, 1, 1, 0, 0]);
     }
 
     #[test]
-    fn test_parse_vp9_color_config() {
-        let data = [0x00]; // 8-bit, color_space=0, transfer=0, matrix=0
-        assert_eq!(parse_vp9_color_config(&data, 0), Some((8, 0, 0, 0, 0)));
-
-        let data_10bit = [0x01]; // 10-bit
-        assert_eq!(
-            parse_vp9_color_config(&data_10bit, 0),
-            Some((10, 0, 0, 0, 0))
-        );
-
-        let data_color = [0x12]; // 8-bit, color_space=1, transfer=1, matrix=0
-        assert_eq!(
-            parse_vp9_color_config(&data_color, 0),
-            Some((8, 1, 1, 0, 0))
-        );
+    fn test_level_table() {
+        assert_eq!(level_for_resolution(100, 100), 10);
+        assert_eq!(level_for_resolution(320, 240), 20);
+        assert_eq!(level_for_resolution(1920, 1080), 40);
+        assert_eq!(level_for_resolution(3840, 2160), 50);
     }
 
     #[test]
-    fn test_parse_vp9_color_config_empty() {
-        let data = [];
-        // Should return defaults when offset is out of bounds
-        assert_eq!(parse_vp9_color_config(&data, 0), Some((8, 0, 0, 0, 0)));
+    fn test_chroma_subsampling_codes() {
+        assert_eq!(chroma_subsampling(true, true), 1);
+        assert_eq!(chroma_subsampling(true, false), 2);
+        assert_eq!(chroma_subsampling(false, false), 3);
+        assert_eq!(chroma_subsampling(false, true), 0);
     }
 }

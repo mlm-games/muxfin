@@ -144,12 +144,13 @@ fn test_new_with_fragment_vp9_success() {
         width: 1920,
         height: 1080,
         profile: 0,
+        level: 40,
         bit_depth: 8,
-        color_space: 0,
-        transfer_function: 0,
-        matrix_coefficients: 0,
-        level: 0,
-        full_range_flag: 0,
+        chroma_subsampling: 1,
+        video_full_range_flag: 0,
+        colour_primaries: 1,
+        transfer_characteristics: 1,
+        matrix_coefficients: 1,
     };
 
     let result = MuxerBuilder::new(writer)

@@ -7,7 +7,7 @@ use crate::codec::av1::{Av1Config, extract_av1_config};
 use crate::codec::h264::{AvcConfig, annexb_to_avcc, default_avc_config, extract_avc_config};
 use crate::codec::h265::{HevcConfig, extract_hevc_config, hevc_annexb_to_hvcc};
 use crate::codec::opus::{OPUS_SAMPLE_RATE, OpusConfig, is_valid_opus_packet};
-use crate::codec::vp9::{Vp9Config, extract_vp9_config};
+use crate::codec::vp9::{Vp9Config, extract_vp9_config, vpcc_payload};
 
 const MOVIE_TIMESCALE: u32 = 1000;
 /// Track/media timebase used for converting `pts` seconds into MP4 sample deltas.
@@ -2590,20 +2590,12 @@ fn build_vp09_box(video: &Mp4VideoTrack, vp9_config: &Vp9Config) -> Vec<u8> {
 
 /// Build a vpcC configuration box for VP9.
 ///
-/// Based on VP9 Codec ISO Media File Format Binding specification.
+/// Layout follows "VP Codec ISO Media File Format Binding": a FullBox
+/// (version 1, flags 0) whose record packs bit depth, chroma subsampling
+/// and range into a single byte and ends with
+/// `codecInitializationDataSize = 0` (mandatory zero for VP9).
 fn build_vpcc_box(vp9_config: &Vp9Config) -> Vec<u8> {
-    let payload = vec![
-        1,                              // Version (1 byte) - set to 1
-        vp9_config.profile,             // Profile (1 byte)
-        vp9_config.level,               // Level (1 byte)
-        vp9_config.bit_depth,           // Bit depth (1 byte)
-        vp9_config.color_space,         // Color space (1 byte)
-        vp9_config.transfer_function,   // Transfer function (1 byte)
-        vp9_config.matrix_coefficients, // Matrix coefficients (1 byte)
-        vp9_config.full_range_flag,     // Video full range flag (1 byte)
-    ];
-
-    build_box(b"vpcC", &payload)
+    build_box(b"vpcC", &vpcc_payload(vp9_config))
 }
 
 fn build_vmhd_box() -> Vec<u8> {
