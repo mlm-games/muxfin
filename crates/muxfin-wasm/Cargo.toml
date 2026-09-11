@@ -14,4 +14,4 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 muxfin.workspace = true
-muxfin-ffi = { path = "../muxfin-ffi", version = "0.2.2" }
+muxfin-ffi.workspace = true

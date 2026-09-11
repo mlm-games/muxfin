@@ -26,6 +26,7 @@ tempfile = "3"
 criterion = "0.5"
 
 muxfin = { path = "crates/muxfin", version = "0.2.3" }
+muxfin-ffi = { path = "crates/muxfin-ffi", version = "0.2.3" }
 
 [profile.release]
 lto = "thin"
