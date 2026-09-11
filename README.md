@@ -109,6 +109,8 @@ If input violates the contract, Muxfin **fails fast** with explicit errors—no 
 | **Audio** | AAC | All profiles: LC, Main, SSR, LTP, HE, HEv2 |
 | | Opus | Raw packets, 48kHz |
 | **Container** | Fast-start | `moov` before `mdat` for web playback |
+| | Matroska (MKV) | H.264/H.265/AV1/VP9 + AAC/Opus + subtitles via `MkvMuxer` |
+| | WebM | VP9/AV1 + Opus (whitelist enforced) |
 | | B-frames | Explicit PTS/DTS support |
 | | Fragmented MP4 | For DASH/HLS streaming |
 | | Metadata | Title, creation time, language |
@@ -234,12 +236,13 @@ let vp9_config = Vp9Config {
     width: 1920,
     height: 1080,
     profile: 0,
+    level: 40,
     bit_depth: 8,
-    color_space: 0,
-    transfer_function: 0,
-    matrix_coefficients: 0,
-    level: 0,
-    full_range_flag: 0,
+    chroma_subsampling: 1,
+    video_full_range_flag: 0,
+    colour_primaries: 1,
+    transfer_characteristics: 1,
+    matrix_coefficients: 1,
 };
 
 let mut muxer = MuxerBuilder::new(file)
@@ -315,6 +318,8 @@ muxfin info
 - **Video:** H.264 (AVC), H.265 (HEVC), AV1
 - **Audio:** AAC (all profiles), Opus
 
+**Supported Containers:** MP4 (default), Matroska (`--format mkv`), WebM (`--format webm`)
+
 **Features:**
 - Progress reporting with `--verbose`
 - JSON output for CI/CD integration
@@ -334,7 +339,7 @@ Muxfin is intentionally **focused**. It does **not**:
 | Transcoding | Not a codec library |
 | Demuxing/reading MP4 | Write-only by design |
 | Timestamp correction | Garbage in = error out |
-| Non-MP4 containers | MKV, WebM, AVI not supported |
+| Non-MP4/MKV/WebM containers | AVI and legacy formats not supported |
 | DRM/encryption | Out of scope |
 
 **Muxfin is the last mile**: encoder output → playable file.

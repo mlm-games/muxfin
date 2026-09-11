@@ -7,7 +7,9 @@ use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 
-use muxfin::api::{AacProfile, AudioCodec, Metadata, Muxer, MuxerBuilder, VideoCodec};
+use muxfin::api::{
+    AacProfile, AudioCodec, ContainerFormat, Metadata, MkvMuxer, Muxer, MuxerBuilder, VideoCodec,
+};
 use muxfin::assert_invariant;
 
 fn read_hex_bytes(contents: &str) -> Vec<u8> {
@@ -50,7 +52,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Mux encoded frames into MP4 (default command)
+    /// Mux encoded frames into MP4/MKV/WebM (default command)
     #[command(alias = "m")]
     Mux {
         /// Input video file(s) or directory
@@ -61,9 +63,13 @@ enum Commands {
         #[arg(short, long)]
         audio: Option<PathBuf>,
 
-        /// Output MP4 file
+        /// Output file (extension may select the container, see --format)
         #[arg(short, long)]
         output: PathBuf,
+
+        /// Output container: mp4, mkv/matroska, webm (default: mp4)
+        #[arg(long, default_value = "mp4")]
+        format: ContainerFormat,
 
         /// Video codec (auto-detected if not specified)
         #[arg(long)]
@@ -237,6 +243,7 @@ fn main() -> Result<()> {
             video,
             audio,
             output,
+            format,
             video_codec,
             width,
             height,
@@ -256,6 +263,7 @@ fn main() -> Result<()> {
                 video,
                 audio,
                 output,
+                format,
                 video_codec,
                 width,
                 height,
@@ -290,6 +298,7 @@ fn mux_command(
     video: Option<PathBuf>,
     audio: Option<PathBuf>,
     output: PathBuf,
+    format: ContainerFormat,
     video_codec: Option<VideoCodec>,
     width: Option<u32>,
     height: Option<u32>,
@@ -395,7 +404,7 @@ fn mux_command(
 
     if fragmented {
         anyhow::bail!(
-            "Fragmented MP4 is not yet supported in the CLI. Use the library API with FragmentedMuxer."
+            "Fragmented output is not yet supported in the CLI. Use the library API with FragmentedMuxer."
         );
     }
 
@@ -494,39 +503,79 @@ fn mux_command(
         eprintln!("Warning: creation_time not yet implemented");
     }
 
-    // Build the muxer
-    let mut muxer = builder.build().with_context(|| "Failed to build muxer")?;
+    // Build the muxer for the selected container.
+    if format.is_matroska_family() {
+        let mut muxer = builder
+            .with_container(format)
+            .build_mkv()
+            .with_context(|| format!("Failed to build {} muxer", format))?;
 
-    // Process video frames
-    if let Some(video_path) = video_path {
-        process_video_frames(&video_path, &mut muxer, &mut progress, verbose)?;
+        // Process video frames
+        if let Some(video_path) = video_path {
+            process_video_frames(&video_path, &mut muxer, &mut progress, verbose)?;
+        }
+
+        // Process audio frames
+        if let Some(audio_path) = audio_path {
+            process_audio_frames(&audio_path, &mut muxer, &mut progress, verbose)?;
+        }
+
+        // Finalize muxing
+        if verbose {
+            eprintln!("Finalizing {}...", format);
+        }
+
+        // Invariant: At least one media stream must be configured
+        assert_invariant!(
+            video.is_some() || audio.is_some(),
+            "At least one media stream (video or audio) must be configured",
+            "cli::mux_command"
+        );
+
+        // Invariant: Output file must be writable
+        assert_invariant!(
+            output.metadata().is_ok(),
+            "Output file path must be writable",
+            "cli::mux_command"
+        );
+
+        muxer
+            .finish()
+            .with_context(|| format!("Failed to finalize {}", format))?;
+    } else {
+        let mut muxer = builder.build().with_context(|| "Failed to build muxer")?;
+
+        // Process video frames
+        if let Some(video_path) = video_path {
+            process_video_frames(&video_path, &mut muxer, &mut progress, verbose)?;
+        }
+
+        // Process audio frames
+        if let Some(audio_path) = audio_path {
+            process_audio_frames(&audio_path, &mut muxer, &mut progress, verbose)?;
+        }
+
+        // Finalize muxing
+        if verbose {
+            eprintln!("Finalizing MP4...");
+        }
+
+        // Invariant: At least one media stream must be configured
+        assert_invariant!(
+            video.is_some() || audio.is_some(),
+            "At least one media stream (video or audio) must be configured",
+            "cli::mux_command"
+        );
+
+        // Invariant: Output file must be writable
+        assert_invariant!(
+            output.metadata().is_ok(),
+            "Output file path must be writable",
+            "cli::mux_command"
+        );
+
+        muxer.finish().with_context(|| "Failed to finalize MP4")?;
     }
-
-    // Process audio frames
-    if let Some(audio_path) = audio_path {
-        process_audio_frames(&audio_path, &mut muxer, &mut progress, verbose)?;
-    }
-
-    // Finalize muxing
-    if verbose {
-        eprintln!("Finalizing MP4...");
-    }
-
-    // Invariant: At least one media stream must be configured
-    assert_invariant!(
-        video.is_some() || audio.is_some(),
-        "At least one media stream (video or audio) must be configured",
-        "cli::mux_command"
-    );
-
-    // Invariant: Output file must be writable
-    assert_invariant!(
-        output.metadata().is_ok(),
-        "Output file path must be writable",
-        "cli::mux_command"
-    );
-
-    muxer.finish().with_context(|| "Failed to finalize MP4")?;
 
     let stats = progress.finish()?;
 
@@ -550,9 +599,40 @@ fn mux_command(
     Ok(())
 }
 
+/// Unified frame sink for the MP4 ([`Muxer`]) and Matroska ([`MkvMuxer`])
+/// frontends so frame ingestion is container-agnostic.
+trait MediaSink {
+    fn push_video(&mut self, pts: f64, data: &[u8]) -> Result<()>;
+    fn push_audio(&mut self, pts: f64, data: &[u8]) -> Result<()>;
+}
+
+impl MediaSink for Muxer<File> {
+    fn push_video(&mut self, pts: f64, data: &[u8]) -> Result<()> {
+        self.write_video(pts, data, true)
+            .with_context(|| "Failed to write video frame")
+    }
+
+    fn push_audio(&mut self, pts: f64, data: &[u8]) -> Result<()> {
+        self.write_audio(pts, data)
+            .with_context(|| "Failed to write audio frame")
+    }
+}
+
+impl MediaSink for MkvMuxer<File> {
+    fn push_video(&mut self, pts: f64, data: &[u8]) -> Result<()> {
+        self.write_video(pts, data, true)
+            .with_context(|| "Failed to write video frame")
+    }
+
+    fn push_audio(&mut self, pts: f64, data: &[u8]) -> Result<()> {
+        self.write_audio(pts, data)
+            .with_context(|| "Failed to write audio frame")
+    }
+}
+
 fn process_video_frames(
     video_path: &PathBuf,
-    muxer: &mut Muxer<File>,
+    muxer: &mut dyn MediaSink,
     progress: &mut ProgressReporter,
     verbose: bool,
 ) -> Result<()> {
@@ -573,9 +653,7 @@ fn process_video_frames(
     let data = read_hex_bytes(&hex_content);
 
     // Write the frame (assuming it's a keyframe at time 0)
-    muxer
-        .write_video(0.0, &data, true)
-        .with_context(|| "Failed to write video frame")?;
+    muxer.push_video(0.0, &data)?;
 
     progress.update_video_frame();
     progress.update_bytes(data.len() as u64);
@@ -585,7 +663,7 @@ fn process_video_frames(
 
 fn process_audio_frames(
     audio_path: &PathBuf,
-    muxer: &mut Muxer<File>,
+    muxer: &mut dyn MediaSink,
     progress: &mut ProgressReporter,
     verbose: bool,
 ) -> Result<()> {
@@ -606,9 +684,7 @@ fn process_audio_frames(
     let data = read_hex_bytes(&hex_content);
 
     // Write the frame at time 0
-    muxer
-        .write_audio(0.0, &data)
-        .with_context(|| "Failed to write audio frame")?;
+    muxer.push_audio(0.0, &data)?;
 
     progress.update_audio_frame();
     progress.update_bytes(data.len() as u64);
@@ -785,6 +861,16 @@ fn info_command(input: PathBuf, verbose: bool, json: bool) -> Result<()> {
         .read_to_end(&mut buffer)
         .with_context(|| "Failed to read file content")?;
 
+    if buffer.len() < 4 {
+        anyhow::bail!("File too small to be a valid media file");
+    }
+
+    // EBML magic (0x1A45DFA3) selects the Matroska/WebM path, which parses
+    // with the external mkv-element crate.
+    if buffer.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return info_matroska_command(&input, &buffer, verbose, json);
+    }
+
     if buffer.len() < 8 {
         anyhow::bail!("File too small to be a valid MP4");
     }
@@ -866,6 +952,132 @@ fn info_command(input: PathBuf, verbose: bool, json: bool) -> Result<()> {
             let size = box_info["size"].as_u64().unwrap();
             println!("  {}: {} bytes", typ, size);
         }
+    }
+
+    Ok(())
+}
+
+/// Inspect a Matroska/WebM file using the external `mkv-element` crate.
+fn info_matroska_command(input: &PathBuf, buffer: &[u8], verbose: bool, json: bool) -> Result<()> {
+    use mkv_element::io::blocking_impl::ReadFrom;
+    use mkv_element::prelude::{Ebml, Segment};
+
+    let mut cursor = std::io::Cursor::new(buffer);
+    let ebml = Ebml::read_from(&mut cursor).with_context(|| "Failed to parse EBML header")?;
+    let doc_type = ebml
+        .doc_type
+        .as_ref()
+        .map(|d| d.0.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    if verbose {
+        eprintln!("DocType: {}", doc_type);
+    }
+
+    let segment = Segment::read_from(&mut cursor).with_context(|| {
+        "Failed to parse Matroska Segment (streaming layouts with unknown-size \
+         Segment/Cluster are not supported by the inspector)"
+    })?;
+
+    let title = segment.info.title.as_ref().map(|t| t.0.clone());
+    let duration = segment.info.duration.as_ref().map(|d| d.0);
+    let track_count = segment
+        .tracks
+        .as_ref()
+        .map(|t| t.track_entry.len())
+        .unwrap_or(0);
+    let cluster_count = segment.cluster.len();
+    let cue_count = segment
+        .cues
+        .as_ref()
+        .map(|c| c.cue_point.len())
+        .unwrap_or(0);
+
+    let mut tracks_json = Vec::new();
+    if let Some(tracks) = &segment.tracks {
+        for entry in &tracks.track_entry {
+            let kind = match *entry.track_type {
+                1 => "video",
+                2 => "audio",
+                17 => "subtitle",
+                other => {
+                    tracks_json.push(serde_json::json!({
+                        "number": *entry.track_number,
+                        "type": format!("unknown({})", other),
+                        "codec": entry.codec_id.0.clone(),
+                    }));
+                    continue;
+                }
+            };
+            let mut track_info = serde_json::json!({
+                "number": *entry.track_number,
+                "type": kind,
+                "codec": entry.codec_id.0.clone(),
+                "language": entry.language.0.clone(),
+            });
+            if let Some(video) = &entry.video {
+                track_info["width"] = serde_json::json!(*video.pixel_width);
+                track_info["height"] = serde_json::json!(*video.pixel_height);
+            }
+            if let Some(audio) = &entry.audio {
+                track_info["sample_rate"] = serde_json::json!(*audio.sampling_frequency);
+                track_info["channels"] = serde_json::json!(*audio.channels);
+            }
+            tracks_json.push(track_info);
+        }
+    }
+
+    let info = serde_json::json!({
+        "file": input.display().to_string(),
+        "file_size": buffer.len(),
+        "container": doc_type,
+        "title": title,
+        "duration_ms": duration,
+        "tracks": tracks_json,
+        "track_count": track_count,
+        "cluster_count": cluster_count,
+        "cue_count": cue_count,
+    });
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&info)?);
+    } else {
+        println!("File: {}", input.display());
+        println!("Size: {} bytes", buffer.len());
+        println!("Container: {}", doc_type);
+        if let Some(title) = &title {
+            println!("Title: {}", title);
+        }
+        if let Some(duration) = duration {
+            println!("Duration: {:.2} s", duration / 1000.0);
+        }
+        println!("Tracks: {}", track_count);
+        for track in &tracks_json {
+            println!(
+                "  track {}: {} ({}){}",
+                track["number"],
+                track["type"].as_str().unwrap_or("?"),
+                track["codec"].as_str().unwrap_or("?"),
+                track
+                    .get("language")
+                    .and_then(|l| l.as_str())
+                    .map(|l| format!(" [{}]", l))
+                    .unwrap_or_default(),
+            );
+            if let (Some(w), Some(h)) = (
+                track.get("width").and_then(|v| v.as_u64()),
+                track.get("height").and_then(|v| v.as_u64()),
+            ) {
+                println!("    dimensions: {}x{}", w, h);
+            }
+            if let (Some(rate), Some(ch)) = (
+                track.get("sample_rate").and_then(|v| v.as_f64()),
+                track.get("channels").and_then(|v| v.as_u64()),
+            ) {
+                println!("    audio: {} Hz, {} ch", rate, ch);
+            }
+        }
+        println!("Clusters: {}", cluster_count);
+        println!("Cues: {}", cue_count);
     }
 
     Ok(())

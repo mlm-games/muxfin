@@ -1344,7 +1344,7 @@ enum TrackKind {
 }
 
 #[allow(clippy::result_large_err)]
-fn adts_to_raw(frame: &[u8]) -> Result<&[u8], AdtsValidationError> {
+pub(crate) fn adts_to_raw(frame: &[u8]) -> Result<&[u8], AdtsValidationError> {
     // Enhanced hex dump with ASCII and color highlighting
     let create_hex_dump = |offset: usize, len: usize| -> String {
         let start = offset.saturating_sub(8).min(frame.len());
@@ -2284,6 +2284,14 @@ fn build_avc1_box(video: &Mp4VideoTrack, avc_config: &AvcConfig) -> Vec<u8> {
 }
 
 fn build_avcc_box(avc_config: &AvcConfig) -> Vec<u8> {
+    build_box(b"avcC", &avcc_payload(avc_config))
+}
+
+/// Raw avcC payload (without the MP4 box header).
+///
+/// Shared with the Matroska muxer: `V_MPEG4/ISO/AVC` stores the same
+/// avcC bytes as `CodecPrivate`.
+pub(crate) fn avcc_payload(avc_config: &AvcConfig) -> Vec<u8> {
     let mut payload = Vec::new();
 
     let (profile_indication, profile_compat, level_indication) = if avc_config.sps.len() >= 4 {
@@ -2303,7 +2311,7 @@ fn build_avcc_box(avc_config: &AvcConfig) -> Vec<u8> {
     payload.push(1);
     payload.extend_from_slice(&(avc_config.pps.len() as u16).to_be_bytes());
     payload.extend_from_slice(&avc_config.pps);
-    build_box(b"avcC", &payload)
+    payload
 }
 
 /// Build an hvc1 sample entry box for HEVC video.
@@ -2355,6 +2363,14 @@ fn build_hvc1_box(video: &Mp4VideoTrack, hevc_config: &HevcConfig) -> Vec<u8> {
 
 /// Build an hvcC configuration box for HEVC.
 fn build_hvcc_box(hevc_config: &HevcConfig) -> Vec<u8> {
+    build_box(b"hvcC", &hvcc_payload(hevc_config))
+}
+
+/// Raw hvcC payload (without the MP4 box header).
+///
+/// Shared with the Matroska muxer: `V_MPEGH/ISO/HEVC` stores the same
+/// hvcC bytes as `CodecPrivate`.
+pub(crate) fn hvcc_payload(hevc_config: &HevcConfig) -> Vec<u8> {
     let mut payload = Vec::new();
 
     // Extract profile/tier/level from SPS
@@ -2426,7 +2442,7 @@ fn build_hvcc_box(hevc_config: &HevcConfig) -> Vec<u8> {
     payload.extend_from_slice(&(hevc_config.pps.len() as u16).to_be_bytes());
     payload.extend_from_slice(&hevc_config.pps);
 
-    build_box(b"hvcC", &payload)
+    payload
 }
 
 /// Build an av01 sample entry box for AV1 video.
@@ -2480,6 +2496,14 @@ fn build_av01_box(video: &Mp4VideoTrack, av1_config: &Av1Config) -> Vec<u8> {
 ///
 /// ISO/IEC 14496-12:2022 and AV1 Codec ISO Media File Format Binding spec.
 fn build_av1c_box(av1_config: &Av1Config) -> Vec<u8> {
+    build_box(b"av1C", &av1c_payload(av1_config))
+}
+
+/// Raw av1C payload (without the MP4 box header).
+///
+/// Shared with the Matroska muxer: `V_AV1` stores the same
+/// av1C bytes as `CodecPrivate`.
+pub(crate) fn av1c_payload(av1_config: &Av1Config) -> Vec<u8> {
     let mut payload = Vec::new();
 
     // Byte 0: marker (1) + version (7) = 0x81
@@ -2515,7 +2539,7 @@ fn build_av1c_box(av1_config: &Av1Config) -> Vec<u8> {
     // configOBUs: Append the Sequence Header OBU
     payload.extend_from_slice(&av1_config.sequence_header);
 
-    build_box(b"av1C", &payload)
+    payload
 }
 
 fn build_vp09_box(video: &Mp4VideoTrack, vp9_config: &Vp9Config) -> Vec<u8> {

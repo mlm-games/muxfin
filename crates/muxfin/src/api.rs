@@ -2,6 +2,7 @@ use crate::assert_invariant;
 use crate::codec::common::AnnexBNalIter;
 use crate::codec::vp9::is_vp9_keyframe;
 use crate::fragmented::{FragmentConfig, FragmentedMuxer};
+use crate::muxer::mkv::{MkvContainer, MkvWriter, MkvWriterError};
 /// Public API definitions for the Muxfin crate.
 ///
 /// This module contains the types and traits that form the public contract
@@ -153,6 +154,60 @@ impl std::str::FromStr for SubtitleCodec {
     }
 }
 
+/// Output container selected for muxing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ContainerFormat {
+    /// ISO-BMFF MP4 (`.mp4`). Default; see [`Muxer`].
+    #[default]
+    Mp4,
+    /// Matroska (`.mkv`): all muxfin codecs; see [`MkvMuxer`].
+    Matroska,
+    /// WebM (`.webm`): VP9/AV1 video and Opus audio only; see [`MkvMuxer`].
+    WebM,
+}
+
+impl ContainerFormat {
+    /// Conventional file extension for this container.
+    pub fn extension(self) -> &'static str {
+        match self {
+            ContainerFormat::Mp4 => "mp4",
+            ContainerFormat::Matroska => "mkv",
+            ContainerFormat::WebM => "webm",
+        }
+    }
+
+    /// Whether this format uses the Matroska/WebM muxer backend.
+    pub fn is_matroska_family(self) -> bool {
+        matches!(self, ContainerFormat::Matroska | ContainerFormat::WebM)
+    }
+}
+
+impl fmt::Display for ContainerFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ContainerFormat::Mp4 => write!(f, "MP4"),
+            ContainerFormat::Matroska => write!(f, "Matroska"),
+            ContainerFormat::WebM => write!(f, "WebM"),
+        }
+    }
+}
+
+impl std::str::FromStr for ContainerFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "mp4" | "m4v" | "isobmff" => Ok(ContainerFormat::Mp4),
+            "mkv" | "matroska" | "mka" => Ok(ContainerFormat::Matroska),
+            "webm" => Ok(ContainerFormat::WebM),
+            _ => Err(format!(
+                "Unknown container format: {} (expected mp4, mkv, or webm)",
+                s
+            )),
+        }
+    }
+}
+
 /// High-level muxer configuration intended for simple integrations (e.g. CrabCamera).
 #[derive(Debug, Clone)]
 pub struct MuxerConfig {
@@ -282,6 +337,8 @@ pub struct MuxerBuilder<Writer> {
     av1_sequence_header: Option<Vec<u8>>,
     /// VP9 configuration for fragmented MP4.
     vp9_config: Option<crate::codec::vp9::Vp9Config>,
+    /// Output container selected for [`MuxerBuilder::build_mkv`].
+    container: ContainerFormat,
 }
 
 impl<Writer> MuxerBuilder<Writer> {
@@ -299,6 +356,7 @@ impl<Writer> MuxerBuilder<Writer> {
             vps: None,
             av1_sequence_header: None,
             vp9_config: None,
+            container: ContainerFormat::Mp4,
         }
     }
 
@@ -330,6 +388,17 @@ impl<Writer> MuxerBuilder<Writer> {
     /// Default is `true` for web streaming compatibility.
     pub fn with_fast_start(mut self, enabled: bool) -> Self {
         self.fast_start = enabled;
+        self
+    }
+
+    /// Select the output container for [`MuxerBuilder::build_mkv`].
+    ///
+    /// `ContainerFormat::Mp4` (the default) is ignored by [`MuxerBuilder::build`],
+    /// which always produces MP4. Use [`MuxerBuilder::build_mkv`] to produce
+    /// Matroska/WebM: with the default `Mp4` value it yields Matroska, otherwise
+    /// the selected Matroska-family container.
+    pub fn with_container(mut self, container: ContainerFormat) -> Self {
+        self.container = container;
         self
     }
 
@@ -564,6 +633,107 @@ impl<Writer> MuxerBuilder<Writer> {
 
         Ok(FragmentedMuxer::new(config))
     }
+
+    /// Finalise the builder and produce an [`MkvMuxer`] instance.
+    ///
+    /// The container comes from [`MuxerBuilder::with_container`]: `Matroska`
+    /// or `WebM` are honoured, while the default `Mp4` yields Matroska.
+    /// Track validation mirrors [`MuxerBuilder::build`], including
+    /// "subtitle requires video".
+    ///
+    /// ```no_run
+    /// use muxfin::api::{ContainerFormat, MuxerBuilder, VideoCodec};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut muxer = MuxerBuilder::new(Vec::<u8>::new())
+    ///     .video(VideoCodec::Vp9, 1920, 1080, 30.0)
+    ///     .with_container(ContainerFormat::WebM)
+    ///     .build_mkv()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if required configuration is missing or invalid.
+    pub fn build_mkv(self) -> Result<MkvMuxer<Writer>, MuxerError>
+    where
+        Writer: Write,
+    {
+        let container = match self.container {
+            ContainerFormat::Mp4 | ContainerFormat::Matroska => MkvContainer::Matroska,
+            ContainerFormat::WebM => MkvContainer::WebM,
+        };
+
+        let video_track = self
+            .video
+            .map(|(codec, width, height, framerate)| VideoTrackConfig {
+                codec,
+                width,
+                height,
+                framerate,
+            });
+
+        let audio_track = self.audio.and_then(|(codec, sample_rate, channels)| {
+            if codec == AudioCodec::None {
+                None
+            } else {
+                Some(AudioTrackConfig {
+                    codec,
+                    sample_rate,
+                    channels,
+                })
+            }
+        });
+
+        let subtitle_track = self.subtitle;
+
+        if subtitle_track.is_some() && video_track.is_none() {
+            return Err(MuxerError::SubtitleRequiresVideo);
+        }
+
+        if video_track.is_none() && audio_track.is_none() && subtitle_track.is_none() {
+            return Err(MuxerError::MissingConfig);
+        }
+
+        let mut writer = MkvWriter::new(self.writer);
+        if let Some(ref video) = video_track {
+            writer.enable_video(video.codec);
+        }
+        if let Some(audio) = &audio_track {
+            writer.enable_audio(Mp4AudioTrack {
+                sample_rate: audio.sample_rate,
+                channels: audio.channels,
+                codec: audio.codec,
+            });
+        }
+        if let Some(subtitle) = &subtitle_track {
+            writer.enable_subtitle(Mp4SubtitleTrack {
+                codec: subtitle.codec,
+                language: subtitle.language.clone(),
+            });
+        }
+
+        Ok(MkvMuxer {
+            writer,
+            video_track,
+            audio_track,
+            subtitle_track,
+            metadata: self.metadata,
+            container,
+            first_video_pts: None,
+            last_video_pts: None,
+            last_video_dts: None,
+            last_audio_pts: None,
+            last_subtitle_pts: None,
+            video_frame_count: 0,
+            audio_frame_count: 0,
+            subtitle_frame_count: 0,
+            finished: false,
+            current_video_pts: 0.0,
+            current_audio_pts: 0.0,
+        })
+    }
 }
 
 /// Configuration for a video track.
@@ -718,6 +888,15 @@ pub enum MuxerError {
         prev_dts: f64,
         curr_dts: f64,
         frame_index: u64,
+    },
+    /// Codec is not allowed in the selected container.
+    UnsupportedForContainer {
+        /// Human-readable codec description.
+        codec: String,
+        /// Human-readable container name.
+        container: String,
+        /// Why it is rejected and what to use instead.
+        reason: String,
     },
 }
 
@@ -954,6 +1133,17 @@ impl fmt::Display for MuxerError {
                     "video frame {} has DTS {:.3}s which is not greater than previous DTS {:.3}s: \
                           DTS (decode timestamps) must strictly increase",
                     frame_index, curr_dts, prev_dts
+                )
+            }
+            MuxerError::UnsupportedForContainer {
+                codec,
+                container,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "codec {} is not supported in {}: {}",
+                    codec, container, reason
                 )
             }
         }
@@ -1289,59 +1479,10 @@ impl<Writer: Write> Muxer<Writer> {
 
     /// Helper to detect if a video frame is a keyframe.
     fn is_keyframe(&self, data: &[u8]) -> bool {
-        // INV-100: Video frame data must not be empty
-        assert_invariant!(
-            !data.is_empty(),
-            "INV-100: Video frame data must not be empty",
-            "api::is_keyframe"
-        );
-
         let Some(codec) = self.video_track.as_ref().map(|t| t.codec) else {
             return false;
         };
-
-        match codec {
-            VideoCodec::H264 => {
-                // Check for IDR NAL (type 5)
-                let has_idr = AnnexBNalIter::new(data).any(|nal| (nal[0] & 0x1f) == 5);
-                has_idr
-            }
-            VideoCodec::H265 => {
-                // Check for IDR NAL (type 19-21)
-                let has_idr = AnnexBNalIter::new(data).any(|nal| {
-                    let nal_type = (nal[0] >> 1) & 0x3f;
-                    (19..=21).contains(&nal_type)
-                });
-                has_idr
-            }
-            VideoCodec::Av1 => {
-                // For AV1, check if it's a key frame (first frame or has key frame flag)
-                // Simple heuristic: first frame is keyframe
-                let is_key = self.video_frame_count == 0;
-
-                // INV-103: AV1 first frame must be keyframe
-                assert_invariant!(
-                    is_key || self.video_frame_count > 0,
-                    "AV1 first frame must be keyframe",
-                    "api::is_keyframe::av1"
-                );
-
-                is_key
-            }
-            VideoCodec::Vp9 => {
-                // Use VP9 keyframe detection
-                let is_key = is_vp9_keyframe(data).unwrap_or(false);
-
-                // INV-104: VP9 keyframe detection must handle invalid frames gracefully
-                assert_invariant!(
-                    is_key || data.len() >= 3,
-                    "VP9 keyframe detection requires minimum frame size",
-                    "api::is_keyframe::vp9"
-                );
-
-                is_key
-            }
-        }
+        detect_keyframe(codec, data, self.video_frame_count)
     }
 
     /// Finalise the container and flush any buffered data.
@@ -1351,7 +1492,63 @@ impl<Writer: Write> Muxer<Writer> {
     pub fn finish_in_place(&mut self) -> Result<(), MuxerError> {
         self.finish_in_place_with_stats().map(|_| ())
     }
+}
 
+/// Shared keyframe detection for the MP4 ([`Muxer`]) and Matroska
+/// ([`MkvMuxer`]) frontends.
+fn detect_keyframe(codec: VideoCodec, data: &[u8], video_frame_count: u64) -> bool {
+    // INV-100: Video frame data must not be empty
+    assert_invariant!(
+        !data.is_empty(),
+        "INV-100: Video frame data must not be empty",
+        "api::is_keyframe"
+    );
+
+    match codec {
+        VideoCodec::H264 => {
+            // Check for IDR NAL (type 5)
+            let has_idr = AnnexBNalIter::new(data).any(|nal| (nal[0] & 0x1f) == 5);
+            has_idr
+        }
+        VideoCodec::H265 => {
+            // Check for IDR NAL (type 19-21)
+            let has_idr = AnnexBNalIter::new(data).any(|nal| {
+                let nal_type = (nal[0] >> 1) & 0x3f;
+                (19..=21).contains(&nal_type)
+            });
+            has_idr
+        }
+        VideoCodec::Av1 => {
+            // For AV1, check if it's a key frame (first frame or has key frame flag)
+            // Simple heuristic: first frame is keyframe
+            let is_key = video_frame_count == 0;
+
+            // INV-103: AV1 first frame must be keyframe
+            assert_invariant!(
+                is_key || video_frame_count > 0,
+                "AV1 first frame must be keyframe",
+                "api::is_keyframe::av1"
+            );
+
+            is_key
+        }
+        VideoCodec::Vp9 => {
+            // Use VP9 keyframe detection
+            let is_key = is_vp9_keyframe(data).unwrap_or(false);
+
+            // INV-104: VP9 keyframe detection must handle invalid frames gracefully
+            assert_invariant!(
+                is_key || data.len() >= 3,
+                "VP9 keyframe detection requires minimum frame size",
+                "api::is_keyframe::vp9"
+            );
+
+            is_key
+        }
+    }
+}
+
+impl<Writer: Write> Muxer<Writer> {
     /// Finalise the container and return muxing statistics.
     pub fn finish_in_place_with_stats(&mut self) -> Result<MuxerStats, MuxerError> {
         if self.finished {
@@ -1366,6 +1563,414 @@ impl<Writer: Write> Muxer<Writer> {
             self.metadata.as_ref(),
             self.fast_start,
         )?;
+        self.finished = true;
+
+        let video_frames = self.writer.video_sample_count();
+        let audio_frames = self.writer.audio_sample_count();
+        let subtitle_frames = self.writer.subtitle_sample_count();
+        let duration_ticks = self.writer.max_end_pts().unwrap_or(0);
+        let duration_secs = duration_ticks as f64 / MEDIA_TIMESCALE as f64;
+        let bytes_written = self.writer.bytes_written();
+
+        Ok(MuxerStats {
+            video_frames,
+            audio_frames,
+            subtitle_frames,
+            duration_secs,
+            bytes_written,
+        })
+    }
+
+    pub fn finish(mut self) -> Result<(), MuxerError> {
+        self.finish_in_place()
+    }
+
+    /// Finalise the container and return muxing statistics.
+    pub fn finish_with_stats(mut self) -> Result<MuxerStats, MuxerError> {
+        self.finish_in_place_with_stats()
+    }
+
+    /// Flush the muxer and finalize the output.
+    pub fn flush(self) -> Result<(), MuxerError> {
+        self.finish()
+    }
+}
+
+/// Matroska/WebM muxer: the parallel counterpart to [`Muxer`] for the
+/// Matroska container family.
+///
+/// Produced by [`MuxerBuilder::build_mkv`]. Timestamp validation, keyframe
+/// requirements and error vocabulary mirror [`Muxer`]; only the container
+/// encoding differs (EBML via the external `mkv-element` crate instead of
+/// ISO-BMFF boxes). `MkvMuxer<W>` is `Send` when `W: Send` and `Sync` when
+/// `W: Sync`.
+pub struct MkvMuxer<Writer> {
+    writer: MkvWriter<Writer>,
+    video_track: Option<VideoTrackConfig>,
+    audio_track: Option<AudioTrackConfig>,
+    subtitle_track: Option<SubtitleTrackConfig>,
+    metadata: Option<Metadata>,
+    container: MkvContainer,
+    first_video_pts: Option<f64>,
+    last_video_pts: Option<f64>,
+    last_video_dts: Option<f64>,
+    last_audio_pts: Option<f64>,
+    last_subtitle_pts: Option<f64>,
+    video_frame_count: u64,
+    audio_frame_count: u64,
+    subtitle_frame_count: u64,
+    finished: bool,
+    current_video_pts: f64,
+    current_audio_pts: f64,
+}
+
+impl<Writer: Write> MkvMuxer<Writer> {
+    /// Which Matroska-family container this muxer writes.
+    pub fn container(&self) -> ContainerFormat {
+        match self.container {
+            MkvContainer::Matroska => ContainerFormat::Matroska,
+            MkvContainer::WebM => ContainerFormat::WebM,
+        }
+    }
+
+    /// Write a video frame to the container.
+    ///
+    /// `pts` is the presentation timestamp in seconds. Frames must be
+    /// supplied in strictly increasing PTS order. The `data` slice uses the
+    /// same input formats as [`Muxer::write_video`] (Annex B for
+    /// H.264/H.265, OBU stream for AV1, compressed frames for VP9).
+    ///
+    /// For streams with B-frames (where PTS != DTS), use
+    /// [`MkvMuxer::write_video_with_dts`] instead.
+    pub fn write_video(
+        &mut self,
+        pts: f64,
+        data: &[u8],
+        is_keyframe: bool,
+    ) -> Result<(), MuxerError> {
+        let frame_index = self.video_frame_count;
+
+        if data.is_empty() {
+            return Err(MuxerError::EmptyVideoFrame { frame_index });
+        }
+        if !pts.is_finite() {
+            return Err(MuxerError::InvalidVideoPts { pts, frame_index });
+        }
+        if pts < 0.0 {
+            return Err(MuxerError::NegativeVideoPts { pts, frame_index });
+        }
+        if let Some(prev) = self.last_video_pts {
+            if pts <= prev {
+                return Err(MuxerError::NonIncreasingVideoPts {
+                    prev_pts: prev,
+                    curr_pts: pts,
+                    frame_index,
+                });
+            }
+        }
+
+        let scaled_pts = (pts * MEDIA_TIMESCALE as f64).round();
+        let pts_units = scaled_pts as u64;
+
+        if self.first_video_pts.is_none() {
+            self.first_video_pts = Some(pts);
+        }
+
+        self.writer
+            .write_video_sample(pts_units, data, is_keyframe)
+            .map_err(|e| self.convert_mkv_error(e, frame_index))?;
+
+        self.last_video_pts = Some(pts);
+        self.video_frame_count += 1;
+        Ok(())
+    }
+
+    /// Write a video frame with explicit decode timestamp for B-frame support.
+    ///
+    /// Semantics mirror [`Muxer::write_video_with_dts`]: frames are fed in
+    /// decode order with strictly increasing DTS, while PTS carries display
+    /// order. B-frames are stored as Matroska `BlockGroup`s with an explicit
+    /// reference marker.
+    pub fn write_video_with_dts(
+        &mut self,
+        pts: f64,
+        dts: f64,
+        data: &[u8],
+        is_keyframe: bool,
+    ) -> Result<(), MuxerError> {
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+
+        let frame_index = self.video_frame_count;
+
+        if data.is_empty() {
+            return Err(MuxerError::EmptyVideoFrame { frame_index });
+        }
+        if !pts.is_finite() {
+            return Err(MuxerError::InvalidVideoPts { pts, frame_index });
+        }
+        if pts < 0.0 {
+            return Err(MuxerError::NegativeVideoPts { pts, frame_index });
+        }
+        if !dts.is_finite() {
+            return Err(MuxerError::InvalidVideoDts { dts, frame_index });
+        }
+        if dts < 0.0 {
+            return Err(MuxerError::NegativeVideoDts { dts, frame_index });
+        }
+        if let Some(prev_dts) = self.last_video_dts {
+            if dts <= prev_dts {
+                return Err(MuxerError::NonIncreasingDts {
+                    prev_dts,
+                    curr_dts: dts,
+                    frame_index,
+                });
+            }
+        }
+
+        let scaled_pts = (pts * MEDIA_TIMESCALE as f64).round();
+        let pts_units = scaled_pts as u64;
+        let scaled_dts = (dts * MEDIA_TIMESCALE as f64).round();
+        let dts_units = scaled_dts as u64;
+
+        if self.first_video_pts.is_none() {
+            self.first_video_pts = Some(pts);
+        }
+
+        self.writer
+            .write_video_sample_with_dts(pts_units, dts_units, data, is_keyframe)
+            .map_err(|e| self.convert_mkv_error(e, frame_index))?;
+
+        self.last_video_pts = Some(pts);
+        self.last_video_dts = Some(dts);
+        self.video_frame_count += 1;
+        Ok(())
+    }
+
+    /// Convert an internal `MkvWriterError` to `MuxerError` with context.
+    fn convert_mkv_error(&self, err: MkvWriterError, frame_index: u64) -> MuxerError {
+        match err {
+            MkvWriterError::NonIncreasingTimestamp => MuxerError::NonIncreasingVideoPts {
+                prev_pts: self.last_video_pts.unwrap_or(0.0),
+                curr_pts: 0.0,
+                frame_index,
+            },
+            MkvWriterError::FirstFrameMustBeKeyframe => MuxerError::FirstVideoFrameMustBeKeyframe,
+            MkvWriterError::FirstFrameMissingSpsPps => MuxerError::FirstVideoFrameMissingSpsPps,
+            MkvWriterError::FirstFrameMissingSequenceHeader => {
+                MuxerError::FirstAv1FrameMissingSequenceHeader
+            }
+            MkvWriterError::FirstFrameMissingVp9Config => {
+                MuxerError::FirstVp9FrameMissingSequenceHeader
+            }
+            MkvWriterError::InvalidAdtsDetailed(error) => {
+                MuxerError::InvalidAdtsDetailed { frame_index, error }
+            }
+            MkvWriterError::InvalidOpusPacket => MuxerError::InvalidOpusPacket { frame_index },
+            MkvWriterError::AudioNotEnabled => MuxerError::AudioNotConfigured,
+            MkvWriterError::SubtitleNotEnabled => MuxerError::SubtitleNotConfigured,
+            MkvWriterError::DurationOverflow => MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "duration overflow",
+            )),
+            MkvWriterError::AlreadyFinalized => MuxerError::AlreadyFinished,
+            MkvWriterError::UnsupportedForWebM { codec, reason } => {
+                MuxerError::UnsupportedForContainer {
+                    codec,
+                    container: self.container.to_string(),
+                    reason,
+                }
+            }
+            MkvWriterError::Encode(message) => MuxerError::Io(std::io::Error::other(message)),
+            MkvWriterError::Io(err) => MuxerError::Io(err),
+        }
+    }
+
+    /// Write an audio frame to the container.
+    ///
+    /// `pts` is the presentation timestamp in seconds. The `data` slice uses
+    /// the same input formats as [`Muxer::write_audio`] (ADTS for AAC, raw
+    /// packets for Opus). Audio timestamps must be non-decreasing and must
+    /// not precede the first video frame.
+    pub fn write_audio(&mut self, pts: f64, data: &[u8]) -> Result<(), MuxerError> {
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+        if self.audio_track.is_none() {
+            return Err(MuxerError::AudioNotConfigured);
+        }
+
+        let frame_index = self.audio_frame_count;
+
+        if !pts.is_finite() {
+            return Err(MuxerError::InvalidAudioPts { pts, frame_index });
+        }
+        if pts < 0.0 {
+            return Err(MuxerError::NegativeAudioPts { pts, frame_index });
+        }
+        if data.is_empty() {
+            return Err(MuxerError::EmptyAudioFrame { frame_index });
+        }
+        if let Some(prev) = self.last_audio_pts {
+            if pts < prev {
+                return Err(MuxerError::DecreasingAudioPts {
+                    prev_pts: prev,
+                    curr_pts: pts,
+                    frame_index,
+                });
+            }
+        }
+        if self.video_track.is_some() {
+            if let Some(first_video) = self.first_video_pts {
+                if pts < first_video {
+                    return Err(MuxerError::AudioBeforeFirstVideo {
+                        audio_pts: pts,
+                        first_video_pts: Some(first_video),
+                    });
+                }
+            } else {
+                return Err(MuxerError::AudioBeforeFirstVideo {
+                    audio_pts: pts,
+                    first_video_pts: None,
+                });
+            }
+        }
+
+        let scaled_pts = (pts * MEDIA_TIMESCALE as f64).round();
+        let pts_units = scaled_pts as u64;
+
+        self.writer
+            .write_audio_sample(pts_units, data)
+            .map_err(|e| self.convert_mkv_error(e, frame_index))?;
+
+        self.last_audio_pts = Some(pts);
+        self.audio_frame_count += 1;
+        Ok(())
+    }
+
+    /// Write a subtitle sample to the container.
+    ///
+    /// `pts` is the presentation timestamp in seconds and `duration` is the
+    /// sample duration in seconds. `text` is a UTF-8 subtitle payload stored
+    /// as `S_TEXT/UTF8`. (WebM rejects subtitles; use Matroska instead.)
+    pub fn write_subtitle(
+        &mut self,
+        pts: f64,
+        duration: f64,
+        text: &str,
+    ) -> Result<(), MuxerError> {
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+        if self.subtitle_track.is_none() {
+            return Err(MuxerError::SubtitleNotConfigured);
+        }
+
+        let frame_index = self.subtitle_frame_count;
+
+        if !pts.is_finite() {
+            return Err(MuxerError::InvalidSubtitlePts { pts, frame_index });
+        }
+        if pts < 0.0 {
+            return Err(MuxerError::NegativeSubtitlePts { pts, frame_index });
+        }
+        if !duration.is_finite() || duration <= 0.0 {
+            return Err(MuxerError::InvalidSubtitleDuration {
+                duration_secs: duration,
+                frame_index,
+            });
+        }
+        if text.is_empty() {
+            return Err(MuxerError::EmptySubtitleSample { frame_index });
+        }
+        if let Some(prev) = self.last_subtitle_pts {
+            if pts < prev {
+                return Err(MuxerError::DecreasingSubtitlePts {
+                    prev_pts: prev,
+                    curr_pts: pts,
+                    frame_index,
+                });
+            }
+        }
+
+        let scaled_pts = (pts * MEDIA_TIMESCALE as f64).round();
+        let pts_units = scaled_pts as u64;
+        let scaled_duration = (duration * MEDIA_TIMESCALE as f64).round().max(1.0);
+        let duration_units = scaled_duration as u32;
+
+        self.writer
+            .write_subtitle_sample(pts_units, duration_units, text.as_bytes())
+            .map_err(|e| self.convert_mkv_error(e, frame_index))?;
+
+        self.last_subtitle_pts = Some(pts);
+        self.subtitle_frame_count += 1;
+        Ok(())
+    }
+
+    /// Simple video encoding method.
+    pub fn encode_video(&mut self, data: &[u8], duration_ms: u32) -> Result<(), MuxerError> {
+        let pts = self.current_video_pts;
+        let is_keyframe = self.detect_keyframe(data);
+        self.write_video(pts, data, is_keyframe)?;
+        self.current_video_pts += duration_ms as f64 / 1000.0;
+        Ok(())
+    }
+
+    /// Simple audio encoding method.
+    pub fn encode_audio(&mut self, data: &[u8], samples: u32) -> Result<(), MuxerError> {
+        if self.audio_track.is_none() {
+            return Err(MuxerError::AudioNotConfigured);
+        }
+        let sample_rate = self.audio_track.as_ref().unwrap().sample_rate;
+        let pts = self.current_audio_pts;
+        self.write_audio(pts, data)?;
+        self.current_audio_pts += samples as f64 / sample_rate as f64;
+        Ok(())
+    }
+
+    /// Helper to detect if a video frame is a keyframe.
+    fn detect_keyframe(&self, data: &[u8]) -> bool {
+        let Some(codec) = self.video_track.as_ref().map(|t| t.codec) else {
+            return false;
+        };
+        detect_keyframe(codec, data, self.video_frame_count)
+    }
+
+    /// Finalise the container and flush any buffered data.
+    pub fn finish_in_place(&mut self) -> Result<(), MuxerError> {
+        self.finish_in_place_with_stats().map(|_| ())
+    }
+
+    /// Finalise the container and return muxing statistics.
+    pub fn finish_in_place_with_stats(&mut self) -> Result<MuxerStats, MuxerError> {
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+        let video_params = self.video_track.as_ref().map(|t| Mp4VideoTrack {
+            width: t.width,
+            height: t.height,
+        });
+        self.writer
+            .finalize(
+                video_params.as_ref(),
+                self.metadata.as_ref(),
+                self.container,
+            )
+            .map_err(|e| {
+                // `finalize` surfaces writer errors as `io::Error`; recover the
+                // structured WebM rejection when present.
+                let message = e.to_string();
+                if message.contains("not allowed in WebM") {
+                    MuxerError::UnsupportedForContainer {
+                        codec: "configured codec".to_string(),
+                        container: self.container.to_string(),
+                        reason: message,
+                    }
+                } else {
+                    MuxerError::Io(e)
+                }
+            })?;
         self.finished = true;
 
         let video_frames = self.writer.video_sample_count();

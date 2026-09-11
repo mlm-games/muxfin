@@ -32,12 +32,15 @@ thiserror.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 indicatif.workspace = true
+bytes.workspace = true
+mkv-element.workspace = true
 
 [dev-dependencies]
 lazy_static.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 criterion.workspace = true
+matroska-demuxer.workspace = true
 
 [[bench]]
 name = "muxing"

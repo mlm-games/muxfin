@@ -11,18 +11,20 @@
 //! ## What Muxfin Does
 //!
 //! - Accepts encoded H.264/H.265/AV1/VP9 video frames with timestamps
-//! - Accepts encoded AAC/Opus audio frames with timestamps  
+//! - Accepts encoded AAC/Opus audio frames with timestamps
 //! - Outputs MP4 files with fast-start (moov before mdat) for instant web playback
+//! - Outputs Matroska (MKV) and WebM via [`api::MkvMuxer`] (EBML via the
+//!   external `mkv-element` crate)
 //! - Supports B-frames via explicit PTS/DTS
 //! - Supports fragmented MP4 (fMP4) for DASH/HLS streaming
 //!
 //! ## What Muxfin Does NOT Do
 //!
 //! - ❌ Encode or decode video/audio (use openh264, x264, etc.)
-//! - ❌ Read or demux MP4 files
+//! - ❌ Read or demux media files
 //! - ❌ Fix bad timestamps (rejects invalid input)
 //! - ❌ DRM, encryption, or content protection
-//! - ❌ MKV, WebM, or other container formats
+//! - ❌ AVI or other legacy container formats
 //!
 //! See `docs/charter.md` and `docs/contract.md` for full invariants.
 //!
