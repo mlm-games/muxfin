@@ -13,6 +13,7 @@ use crate::muxer::mkv::{MkvContainer, MkvWriter, MkvWriterError};
 use crate::muxer::mp4::{
     MEDIA_TIMESCALE, Mp4AudioTrack, Mp4SubtitleTrack, Mp4VideoTrack, Mp4Writer, Mp4WriterError,
 };
+use crate::muxer::streaming::SeekableStreamingWriter;
 use crate::time::{EncodedSample, LanguageCode, Limits, SubtitleCue};
 use std::fmt;
 use std::io::Write;
@@ -431,6 +432,20 @@ pub struct MuxerBuilder<Writer> {
     limits: Limits,
 }
 
+/// Structural validation for a caller-supplied Opus `dOps` config
+/// (RFC 7845 §5.1.1). Runs in every `build_*` path so multichannel
+/// layouts (family ≥ 1) cannot reach the box builders unchecked.
+fn validate_opus_config(config: Option<&crate::codec::opus::OpusConfig>) -> Result<(), MuxerError> {
+    if let Some(config) = config {
+        config
+            .validate()
+            .map_err(|e| MuxerError::InvalidOpusConfig {
+                reason: e.to_string(),
+            })?;
+    }
+    Ok(())
+}
+
 impl<Writer> MuxerBuilder<Writer> {
     /// Create a new builder for the given output writer.
     pub fn new(writer: Writer) -> Self {
@@ -668,6 +683,7 @@ impl<Writer> MuxerBuilder<Writer> {
     where
         Writer: Write,
     {
+        validate_opus_config(self.opus_config.as_ref())?;
         let mut video_track =
             self.video
                 .map(|(codec, width, height, framerate)| VideoTrackConfig {
@@ -792,6 +808,155 @@ impl<Writer> MuxerBuilder<Writer> {
         })
     }
 
+    /// Create a seekable-streaming MP4 muxer (§5).
+    ///
+    /// Unlike [`MuxerBuilder::build`], sample bytes are written to the
+    /// builder's writer as they arrive and only per-sample metadata is
+    /// retained, so peak RAM is O(metadata) instead of O(media). The writer
+    /// must implement [`std::io::Seek`] (files, `Cursor<Vec<u8>>`) because
+    /// `finish` seeks back to patch the `mdat` size before appending `moov`.
+    ///
+    /// The output layout is `ftyp`, `mdat`, `moov` (progressive). For
+    /// fast-start `moov`-before-`mdat`, use [`MuxerBuilder::build`].
+    /// Validation, bitstream conversion, and timestamp rules are identical
+    /// to [`Muxer`]; only the buffering strategy differs.
+    pub fn build_streaming_seekable(self) -> Result<StreamingMuxer<Writer>, MuxerError>
+    where
+        Writer: Write + std::io::Seek,
+    {
+        validate_opus_config(self.opus_config.as_ref())?;
+        let mut video_track =
+            self.video
+                .map(|(codec, width, height, framerate)| VideoTrackConfig {
+                    codec,
+                    width,
+                    height,
+                    framerate,
+                    timescale: 90_000,
+                    language: LanguageCode::UND,
+                });
+        if let (Some(t), Some(lang)) = (video_track.as_mut(), self.video_language) {
+            t.language = lang;
+        }
+
+        let mut audio_track = self.audio.and_then(|(codec, sample_rate, channels)| {
+            if codec == AudioCodec::None {
+                None
+            } else {
+                let timescale = match codec {
+                    AudioCodec::Opus => 48_000,
+                    _ => sample_rate,
+                };
+                Some(AudioTrackConfig {
+                    codec,
+                    sample_rate,
+                    channels,
+                    timescale,
+                    language: LanguageCode::UND,
+                })
+            }
+        });
+        if let (Some(t), Some(lang)) = (audio_track.as_mut(), self.audio_language) {
+            t.language = lang;
+        }
+
+        let subtitle_track = self.subtitle;
+
+        if subtitle_track.is_some() && video_track.is_none() {
+            return Err(MuxerError::SubtitleRequiresVideo);
+        }
+
+        if video_track.is_none() && audio_track.is_none() && subtitle_track.is_none() {
+            return Err(MuxerError::MissingConfig);
+        }
+
+        if let Some(audio) = &audio_track
+            && audio.codec == AudioCodec::Flac
+        {
+            let info = self.flac_streaminfo.as_ref().ok_or_else(|| {
+                MuxerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "FLAC STREAMINFO must be provided for FLAC audio using with_flac_streaminfo()",
+                ))
+            })?;
+            let parsed = crate::codec::flac::parse_streaminfo(info).ok_or_else(|| {
+                MuxerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "FLAC STREAMINFO must be a valid 34-byte STREAMINFO block",
+                ))
+            })?;
+            if audio.sample_rate != parsed.sample_rate
+                || audio.channels != u16::from(parsed.channels)
+            {
+                return Err(MuxerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "FLAC track parameters ({} Hz, {} ch) disagree with STREAMINFO ({} Hz, {} ch)",
+                        audio.sample_rate, audio.channels, parsed.sample_rate, parsed.channels
+                    ),
+                )));
+            }
+        }
+
+        let mut state: Mp4Writer<std::io::Sink> = Mp4Writer::new(std::io::sink());
+        if let Some(ref video) = video_track {
+            if let Some(cfg) = self.video_decoder_config.clone() {
+                state.enable_video_with_config(video.codec, cfg);
+            } else {
+                state.enable_video(video.codec);
+            }
+        }
+        if let Some(audio) = &audio_track {
+            state.enable_audio(Mp4AudioTrack {
+                sample_rate: audio.sample_rate,
+                channels: audio.channels,
+                codec: audio.codec,
+                flac_streaminfo: self.flac_streaminfo.clone(),
+                opus_preskip: self.opus_preskip,
+                aac_asc_override: self.aac_config.clone().map(|c| c.audio_specific_config),
+                opus_config_override: self.opus_config.clone(),
+                language: Some(String::from_utf8_lossy(&audio.language.as_bytes()).into_owned()),
+            });
+        }
+        if let Some(subtitle) = &subtitle_track {
+            state.enable_subtitle(Mp4SubtitleTrack {
+                codec: subtitle.codec,
+                language: subtitle.language.clone(),
+            });
+        }
+
+        let video_params = video_track.as_ref().map(|t| Mp4VideoTrack {
+            width: t.width,
+            height: t.height,
+            language: Some(String::from_utf8_lossy(&t.language.as_bytes()).into_owned()),
+        });
+        let video_codec = video_track.as_ref().map(|t| t.codec);
+        let inner =
+            SeekableStreamingWriter::begin(self.writer, state, video_params, self.metadata.clone())
+                .map_err(MuxerError::Io)?;
+
+        Ok(StreamingMuxer {
+            inner,
+            video_track,
+            audio_track,
+            subtitle_track,
+            video_codec,
+            limits: self.limits,
+            first_video_pts: None,
+            last_video_pts: None,
+            last_video_dts: None,
+            last_audio_pts: None,
+            last_subtitle_pts: None,
+            video_frame_count: 0,
+            audio_frame_count: 0,
+            subtitle_frame_count: 0,
+            video_end_ticks: None,
+            audio_end_ticks: None,
+            subtitle_end_ticks: None,
+            finished: false,
+        })
+    }
+
     /// Create a fragmented MP4 muxer.
     ///
     /// This creates a `FragmentedMuxer` with the configuration from this builder.
@@ -908,6 +1073,7 @@ impl<Writer> MuxerBuilder<Writer> {
     where
         Writer: Write,
     {
+        validate_opus_config(self.opus_config.as_ref())?;
         let container = match self.container {
             ContainerFormat::Mp4 | ContainerFormat::Matroska => MkvContainer::Matroska,
             ContainerFormat::WebM => MkvContainer::WebM,
@@ -1199,6 +1365,8 @@ pub enum MuxerError {
     },
     /// Audio sample is not a valid Opus packet.
     InvalidOpusPacket { frame_index: u64 },
+    /// Caller-supplied Opus `dOps` config failed structural validation.
+    InvalidOpusConfig { reason: String },
     /// Audio sample is not a valid FLAC frame.
     InvalidFlacFrame { frame_index: u64 },
     /// DTS must be monotonically increasing.
@@ -1462,6 +1630,9 @@ impl fmt::Display for MuxerError {
                     "audio frame {} is not a valid Opus packet: ensure the frame has valid TOC byte",
                     frame_index
                 )
+            }
+            MuxerError::InvalidOpusConfig { reason } => {
+                write!(f, "invalid Opus dOps config: {}", reason)
             }
             MuxerError::InvalidFlacFrame { frame_index } => {
                 write!(
@@ -2150,6 +2321,515 @@ impl<Writer: Write> Muxer<Writer> {
     /// Finalise the container and return muxing statistics.
     pub fn finish_with_stats(mut self) -> Result<MuxerStats, MuxerError> {
         self.finish_in_place_with_stats()
+    }
+
+    /// Flush the muxer and finalize the output.
+    pub fn flush(self) -> Result<(), MuxerError> {
+        self.finish()
+    }
+}
+
+/// Seekable-streaming MP4 muxer: the bounded-RAM counterpart to [`Muxer`].
+///
+/// Produced by [`MuxerBuilder::build_streaming_seekable`]. Sample bytes are
+/// written to the output as they arrive; only per-sample metadata is kept,
+/// so peak RAM is O(metadata) instead of O(media). Requires `W: Write +
+/// Seek` (files, `Cursor<Vec<u8>>`).
+///
+/// Timestamp validation, keyframe requirements, decoder-config rules, and
+/// the error vocabulary mirror [`Muxer`]; the output layout is
+/// `ftyp`, `mdat`, `moov` (progressive) rather than fast-start.
+pub struct StreamingMuxer<Writer> {
+    inner: SeekableStreamingWriter<Writer>,
+    video_track: Option<VideoTrackConfig>,
+    audio_track: Option<AudioTrackConfig>,
+    subtitle_track: Option<SubtitleTrackConfig>,
+    video_codec: Option<VideoCodec>,
+    limits: Limits,
+    first_video_pts: Option<f64>,
+    last_video_pts: Option<f64>,
+    last_video_dts: Option<f64>,
+    last_audio_pts: Option<f64>,
+    last_subtitle_pts: Option<f64>,
+    video_frame_count: u64,
+    audio_frame_count: u64,
+    subtitle_frame_count: u64,
+    video_end_ticks: Option<u64>,
+    audio_end_ticks: Option<u64>,
+    subtitle_end_ticks: Option<u64>,
+    finished: bool,
+}
+
+impl<Writer: Write + std::io::Seek> StreamingMuxer<Writer> {
+    fn convert_mp4_error(&self, err: Mp4WriterError, frame_index: u64) -> MuxerError {
+        match err {
+            Mp4WriterError::NonIncreasingTimestamp => MuxerError::NonIncreasingVideoPts {
+                prev_pts: self.last_video_pts.unwrap_or(0.0),
+                curr_pts: 0.0,
+                frame_index,
+            },
+            Mp4WriterError::FirstFrameMustBeKeyframe => MuxerError::FirstVideoFrameMustBeKeyframe,
+            Mp4WriterError::FirstFrameMissingSpsPps => MuxerError::FirstVideoFrameMissingSpsPps,
+            Mp4WriterError::FirstFrameMissingSequenceHeader => {
+                MuxerError::FirstAv1FrameMissingSequenceHeader
+            }
+            Mp4WriterError::FirstFrameMissingVp9Config => {
+                MuxerError::FirstVp9FrameMissingSequenceHeader
+            }
+            Mp4WriterError::InvalidAdts => MuxerError::InvalidAdts { frame_index },
+            Mp4WriterError::InvalidAdtsDetailed(error) => {
+                MuxerError::InvalidAdtsDetailed { frame_index, error }
+            }
+            Mp4WriterError::InvalidOpusPacket => MuxerError::InvalidOpusPacket { frame_index },
+            Mp4WriterError::InvalidFlacFrame => MuxerError::InvalidFlacFrame { frame_index },
+            Mp4WriterError::MissingFlacStreaminfo => MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "FLAC STREAMINFO must be provided using with_flac_streaminfo()",
+            )),
+            Mp4WriterError::AudioNotEnabled => MuxerError::AudioNotConfigured,
+            Mp4WriterError::SubtitleNotEnabled => MuxerError::SubtitleNotConfigured,
+            Mp4WriterError::DurationOverflow => MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "duration overflow",
+            )),
+            Mp4WriterError::DecoderConfigurationChanged => MuxerError::DecoderConfigurationChanged,
+            Mp4WriterError::AlreadyFinalized => MuxerError::AlreadyFinished,
+            Mp4WriterError::Io(err) => MuxerError::Io(err),
+        }
+    }
+
+    /// Total bytes written so far (headers + streamed samples).
+    pub fn bytes_written(&self) -> u64 {
+        self.inner.bytes_written()
+    }
+
+    /// Push one video sample at media-timescale ticks.
+    ///
+    /// `duration` is `Some` for the integer API (explicit) and `None` for
+    /// the `f64` shims (inferred from the next sample, as in [`Muxer`]).
+    fn push_video(
+        &mut self,
+        pts_u: u64,
+        dts_u: u64,
+        data: &[u8],
+        is_sync: bool,
+        duration: Option<u32>,
+    ) -> Result<(), MuxerError> {
+        let frame_index = self.video_frame_count;
+        if self.video_track.is_none() {
+            return Err(MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "video track not configured",
+            )));
+        }
+        if self.video_frame_count as usize >= self.limits.max_samples_per_track {
+            return Err(MuxerError::ResourceLimitExceeded {
+                what: "video samples",
+            });
+        }
+        self.inner
+            .write_video_sample_with_dts(pts_u, dts_u, data, is_sync)
+            .map_err(|e| self.convert_mp4_error(e, frame_index))?;
+        if let Some(dur) = duration {
+            self.inner.set_last_video_duration(dur);
+            self.video_end_ticks = Some(pts_u.saturating_add(u64::from(dur)));
+        }
+        let pts_f = pts_u as f64 / MEDIA_TIMESCALE as f64;
+        let dts_f = dts_u as f64 / MEDIA_TIMESCALE as f64;
+        if self.first_video_pts.is_none() {
+            self.first_video_pts = Some(pts_f);
+        }
+        self.last_video_pts = Some(pts_f);
+        self.last_video_dts = Some(dts_f);
+        self.video_frame_count += 1;
+        Ok(())
+    }
+
+    /// Write a video sample with integer timestamps and explicit duration.
+    ///
+    /// Preferred API (verdict §§3-4); mirrors [`Muxer::write_video_sample`].
+    pub fn write_video_sample(&mut self, sample: EncodedSample<'_>) -> Result<(), MuxerError> {
+        use crate::time::{Timescale, rescale};
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+        let frame_index = self.video_frame_count;
+        if sample.data.is_empty() {
+            return Err(MuxerError::EmptyVideoFrame { frame_index });
+        }
+        if sample.timing.duration == 0 {
+            return Err(MuxerError::ZeroDuration);
+        }
+        if sample.timing.pts < 0 || sample.timing.dts < 0 {
+            return Err(MuxerError::NegativeVideoDts {
+                dts: sample.timing.dts as f64,
+                frame_index,
+            });
+        }
+        let _ = sample.timing.composition_offset()?;
+        if sample.data.len() > self.limits.max_sample_size {
+            return Err(MuxerError::ResourceLimitExceeded {
+                what: "video sample",
+            });
+        }
+        let track_ts = self
+            .video_track
+            .as_ref()
+            .map(|t| t.timescale)
+            .unwrap_or(90_000);
+        let from = Timescale::new(core::num::NonZeroU32::new(track_ts.max(1)).unwrap());
+        let to = Timescale::new(core::num::NonZeroU32::new(MEDIA_TIMESCALE).unwrap());
+        let pts_i64 = rescale(sample.timing.pts, from, to)?;
+        let dts_i64 = rescale(sample.timing.dts, from, to)?;
+        let dur_i64 = rescale(i64::from(sample.timing.duration), from, to)?;
+        if dur_i64 <= 0 || dur_i64 > i64::from(u32::MAX) {
+            return Err(MuxerError::ZeroDuration);
+        }
+        let pts_u = u64::try_from(pts_i64).map_err(|_| MuxerError::TimestampOverflow)?;
+        let dts_u = u64::try_from(dts_i64).map_err(|_| MuxerError::TimestampOverflow)?;
+        if let Some(prev_f) = self.last_video_dts {
+            let prev_u = (prev_f * MEDIA_TIMESCALE as f64).round() as u64;
+            if dts_u <= prev_u {
+                return Err(MuxerError::NonIncreasingIntDts {
+                    previous: prev_u as i64,
+                    current: dts_u as i64,
+                });
+            }
+        }
+        self.push_video(
+            pts_u,
+            dts_u,
+            sample.data,
+            sample.is_sync,
+            Some(dur_i64 as u32),
+        )
+    }
+
+    /// Write a video frame (`dts == pts`), `f64` compat shim.
+    pub fn write_video(
+        &mut self,
+        pts: f64,
+        data: &[u8],
+        is_keyframe: bool,
+    ) -> Result<(), MuxerError> {
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+        let frame_index = self.video_frame_count;
+        if data.is_empty() {
+            return Err(MuxerError::EmptyVideoFrame { frame_index });
+        }
+        if !pts.is_finite() {
+            return Err(MuxerError::InvalidVideoPts { pts, frame_index });
+        }
+        if pts < 0.0 {
+            return Err(MuxerError::NegativeVideoPts { pts, frame_index });
+        }
+        if let Some(prev) = self.last_video_pts {
+            if pts <= prev {
+                return Err(MuxerError::NonIncreasingVideoPts {
+                    prev_pts: prev,
+                    curr_pts: pts,
+                    frame_index,
+                });
+            }
+        }
+        let pts_u = (pts * MEDIA_TIMESCALE as f64).round() as u64;
+        self.push_video(pts_u, pts_u, data, is_keyframe, None)
+    }
+
+    /// Write a video frame with explicit decode timestamp, `f64` compat shim.
+    pub fn write_video_with_dts(
+        &mut self,
+        pts: f64,
+        dts: f64,
+        data: &[u8],
+        is_keyframe: bool,
+    ) -> Result<(), MuxerError> {
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+        let frame_index = self.video_frame_count;
+        if data.is_empty() {
+            return Err(MuxerError::EmptyVideoFrame { frame_index });
+        }
+        if !pts.is_finite() {
+            return Err(MuxerError::InvalidVideoPts { pts, frame_index });
+        }
+        if pts < 0.0 {
+            return Err(MuxerError::NegativeVideoPts { pts, frame_index });
+        }
+        if !dts.is_finite() {
+            return Err(MuxerError::InvalidVideoDts { dts, frame_index });
+        }
+        if dts < 0.0 {
+            return Err(MuxerError::NegativeVideoDts { dts, frame_index });
+        }
+        if let Some(prev_dts) = self.last_video_dts {
+            if dts <= prev_dts {
+                return Err(MuxerError::NonIncreasingDts {
+                    prev_dts,
+                    curr_dts: dts,
+                    frame_index,
+                });
+            }
+        }
+        let pts_u = (pts * MEDIA_TIMESCALE as f64).round() as u64;
+        let dts_u = (dts * MEDIA_TIMESCALE as f64).round() as u64;
+        self.push_video(pts_u, dts_u, data, is_keyframe, None)
+    }
+
+    /// Push one audio sample at media-timescale ticks.
+    fn push_audio(
+        &mut self,
+        pts_u: u64,
+        data: &[u8],
+        duration: Option<u32>,
+    ) -> Result<(), MuxerError> {
+        let frame_index = self.audio_frame_count;
+        if self.audio_track.is_none() {
+            return Err(MuxerError::AudioNotConfigured);
+        }
+        if self.audio_frame_count as usize >= self.limits.max_samples_per_track {
+            return Err(MuxerError::ResourceLimitExceeded {
+                what: "audio samples",
+            });
+        }
+        self.inner
+            .write_audio_sample(pts_u, data)
+            .map_err(|e| self.convert_mp4_error(e, frame_index))?;
+        if let Some(dur) = duration {
+            self.inner.set_last_audio_duration(dur);
+            self.audio_end_ticks = Some(pts_u.saturating_add(u64::from(dur)));
+        }
+        self.last_audio_pts = Some(pts_u as f64 / MEDIA_TIMESCALE as f64);
+        self.audio_frame_count += 1;
+        Ok(())
+    }
+
+    /// Write an audio sample with integer timestamps and explicit duration.
+    pub fn write_audio_sample(&mut self, sample: EncodedSample<'_>) -> Result<(), MuxerError> {
+        use crate::time::{Timescale, rescale};
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+        if self.audio_track.is_none() {
+            return Err(MuxerError::AudioNotConfigured);
+        }
+        let frame_index = self.audio_frame_count;
+        if sample.data.is_empty() {
+            return Err(MuxerError::EmptyAudioFrame { frame_index });
+        }
+        if sample.timing.duration == 0 {
+            return Err(MuxerError::ZeroDuration);
+        }
+        if sample.timing.pts < 0 {
+            return Err(MuxerError::NegativeAudioPts {
+                pts: sample.timing.pts as f64,
+                frame_index,
+            });
+        }
+        if sample.data.len() > self.limits.max_sample_size {
+            return Err(MuxerError::ResourceLimitExceeded {
+                what: "audio sample",
+            });
+        }
+        let track_ts = self
+            .audio_track
+            .as_ref()
+            .map(|t| t.timescale)
+            .unwrap_or(48_000);
+        let from = Timescale::new(core::num::NonZeroU32::new(track_ts.max(1)).unwrap());
+        let to = Timescale::new(core::num::NonZeroU32::new(MEDIA_TIMESCALE).unwrap());
+        let pts_i64 = rescale(sample.timing.pts, from, to)?;
+        let dur_i64 = rescale(i64::from(sample.timing.duration), from, to)?;
+        if dur_i64 <= 0 || dur_i64 > i64::from(u32::MAX) {
+            return Err(MuxerError::ZeroDuration);
+        }
+        let pts_u = u64::try_from(pts_i64).map_err(|_| MuxerError::TimestampOverflow)?;
+        self.push_audio(pts_u, sample.data, Some(dur_i64 as u32))
+    }
+
+    /// Write an audio frame, `f64` compat shim.
+    pub fn write_audio(&mut self, pts: f64, data: &[u8]) -> Result<(), MuxerError> {
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+        if self.audio_track.is_none() {
+            return Err(MuxerError::AudioNotConfigured);
+        }
+        let frame_index = self.audio_frame_count;
+        if !pts.is_finite() {
+            return Err(MuxerError::InvalidAudioPts { pts, frame_index });
+        }
+        if pts < 0.0 {
+            return Err(MuxerError::NegativeAudioPts { pts, frame_index });
+        }
+        if data.is_empty() {
+            return Err(MuxerError::EmptyAudioFrame { frame_index });
+        }
+        if let Some(prev) = self.last_audio_pts {
+            if pts < prev {
+                return Err(MuxerError::DecreasingAudioPts {
+                    prev_pts: prev,
+                    curr_pts: pts,
+                    frame_index,
+                });
+            }
+        }
+        let pts_u = (pts * MEDIA_TIMESCALE as f64).round() as u64;
+        self.push_audio(pts_u, data, None)
+    }
+
+    /// Write a subtitle cue with explicit start/duration (verdict §9).
+    pub fn write_subtitle_cue(&mut self, cue: SubtitleCue<'_>) -> Result<(), MuxerError> {
+        use crate::time::{Timescale, rescale};
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+        let track = self
+            .subtitle_track
+            .clone()
+            .ok_or(MuxerError::SubtitleNotConfigured)?;
+        let frame_index = self.subtitle_frame_count;
+        if cue.text.is_empty() {
+            return Err(MuxerError::EmptySubtitleSample { frame_index });
+        }
+        if cue.duration == 0 {
+            return Err(MuxerError::ZeroDuration);
+        }
+        if cue.text.len() > self.limits.max_subtitle_size {
+            return Err(MuxerError::SubtitleTooLarge(cue.text.len()));
+        }
+        if self.subtitle_frame_count as usize >= self.limits.max_samples_per_track {
+            return Err(MuxerError::ResourceLimitExceeded {
+                what: "subtitle samples",
+            });
+        }
+        let from = Timescale::new(core::num::NonZeroU32::new(track.timescale.max(1)).unwrap());
+        let to = Timescale::new(core::num::NonZeroU32::new(MEDIA_TIMESCALE).unwrap());
+        let pts_i64 = rescale(cue.start, from, to)?;
+        let dur_i64 = rescale(i64::from(cue.duration), from, to)?;
+        if pts_i64 < 0 {
+            return Err(MuxerError::NegativeSubtitleDts { dts: pts_i64 });
+        }
+        if dur_i64 <= 0 || dur_i64 > i64::from(u32::MAX) {
+            return Err(MuxerError::ZeroDuration);
+        }
+        let pts_u = u64::try_from(pts_i64).map_err(|_| MuxerError::TimestampOverflow)?;
+        let encoded = match track.codec {
+            SubtitleCodec::MovText => {
+                crate::muxer::mp4::Mp4Writer::<Vec<u8>>::encode_tx3g_sample(cue.text)
+                    .map_err(|_| MuxerError::SubtitleTooLarge(cue.text.len()))?
+            }
+            SubtitleCodec::WebVtt => {
+                let mut vttc_payload = Vec::new();
+                let payl = {
+                    let mut p = Vec::new();
+                    p.extend_from_slice(&(8 + cue.text.len() as u64).to_be_bytes()[4..8]);
+                    p.extend_from_slice(b"payl");
+                    p.extend_from_slice(cue.text.as_bytes());
+                    p
+                };
+                vttc_payload.extend_from_slice(&payl);
+                let mut vttc = Vec::new();
+                vttc.extend_from_slice(&(8 + vttc_payload.len() as u64).to_be_bytes()[4..8]);
+                vttc.extend_from_slice(b"vttc");
+                vttc.extend_from_slice(&vttc_payload);
+                vttc
+            }
+        };
+        self.inner
+            .write_subtitle_sample(pts_u, dur_i64 as u32, &encoded)
+            .map_err(|e| self.convert_mp4_error(e, frame_index))?;
+        self.subtitle_end_ticks = Some(pts_u.saturating_add(dur_i64 as u64));
+        self.last_subtitle_pts = Some(pts_u as f64 / MEDIA_TIMESCALE as f64);
+        self.subtitle_frame_count += 1;
+        Ok(())
+    }
+
+    /// Write a subtitle, `f64` compat shim.
+    pub fn write_subtitle(
+        &mut self,
+        pts: f64,
+        duration: f64,
+        text: &str,
+    ) -> Result<(), MuxerError> {
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+        if self.subtitle_track.is_none() {
+            return Err(MuxerError::SubtitleNotConfigured);
+        }
+        let frame_index = self.subtitle_frame_count;
+        if !pts.is_finite() {
+            return Err(MuxerError::InvalidSubtitlePts { pts, frame_index });
+        }
+        if pts < 0.0 {
+            return Err(MuxerError::NegativeSubtitlePts { pts, frame_index });
+        }
+        if !duration.is_finite() || duration <= 0.0 {
+            return Err(MuxerError::InvalidSubtitleDuration {
+                duration_secs: duration,
+                frame_index,
+            });
+        }
+        if text.is_empty() {
+            return Err(MuxerError::EmptySubtitleSample { frame_index });
+        }
+        if let Some(prev) = self.last_subtitle_pts {
+            if pts < prev {
+                return Err(MuxerError::DecreasingSubtitlePts {
+                    prev_pts: prev,
+                    curr_pts: pts,
+                    frame_index,
+                });
+            }
+        }
+        let pts_u = (pts * MEDIA_TIMESCALE as f64).round() as u64;
+        let dur_u = (duration * MEDIA_TIMESCALE as f64).round().max(1.0) as u32;
+        let encoded = crate::muxer::mp4::Mp4Writer::<Vec<u8>>::encode_tx3g_sample(text)
+            .map_err(|_| MuxerError::SubtitleTooLarge(text.len()))?;
+        self.inner
+            .write_subtitle_sample(pts_u, dur_u, &encoded)
+            .map_err(|e| self.convert_mp4_error(e, frame_index))?;
+        self.subtitle_end_ticks = Some(pts_u.saturating_add(u64::from(dur_u)));
+        self.last_subtitle_pts = Some(pts);
+        self.subtitle_frame_count += 1;
+        Ok(())
+    }
+
+    /// Finish: patch `mdat`, append `moov`, return statistics.
+    pub fn finish_with_stats(mut self) -> Result<MuxerStats, MuxerError> {
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+        self.finished = true;
+        let bytes_written = self
+            .inner
+            .finish(self.video_codec)
+            .map_err(MuxerError::Io)?;
+        let duration_ticks = [
+            self.video_end_ticks,
+            self.audio_end_ticks,
+            self.subtitle_end_ticks,
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(0);
+        Ok(MuxerStats {
+            video_frames: self.video_frame_count,
+            audio_frames: self.audio_frame_count,
+            subtitle_frames: self.subtitle_frame_count,
+            duration_secs: duration_ticks as f64 / MEDIA_TIMESCALE as f64,
+            bytes_written,
+        })
+    }
+
+    /// Finish the container.
+    pub fn finish(self) -> Result<(), MuxerError> {
+        self.finish_with_stats().map(|_| ())
     }
 
     /// Flush the muxer and finalize the output.

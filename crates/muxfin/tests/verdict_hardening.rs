@@ -245,3 +245,105 @@ fn segment_boundary_manual_never_auto_flushes() {
     assert!(!muxer.ready_to_flush());
     assert!(muxer.flush_segment().is_some());
 }
+
+#[test]
+fn opus_invalid_dops_rejected_at_build() {
+    use muxfin::api::OpusConfig;
+    // Family 0 with 6 channels is structurally invalid.
+    let bad = OpusConfig {
+        output_channel_count: 6,
+        ..OpusConfig::default()
+    };
+    let result = MuxerBuilder::new(Vec::<u8>::new())
+        .audio(AudioCodec::Opus, 48_000, 6)
+        .with_opus_config(bad)
+        .build();
+    let err = match result {
+        Ok(_) => panic!("expected InvalidOpusConfig"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, MuxerError::InvalidOpusConfig { .. }),
+        "unexpected error: {err:?}"
+    );
+    // A valid 5.1 config builds fine.
+    MuxerBuilder::new(Vec::<u8>::new())
+        .audio(AudioCodec::Opus, 48_000, 6)
+        .with_opus_config(OpusConfig::surround_51())
+        .build()
+        .unwrap();
+}
+
+#[test]
+fn access_unit_file_remux() {
+    use muxfin::codec::access_unit::split_h264_access_units;
+    // Raw Annex B stream: AUD-delimited IDR + P frames.
+    let mut raw = Vec::new();
+    for nal in [
+        [0x00, 0x00, 0x00, 0x01, 0x09, 0x10].as_slice(),
+        [0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1e].as_slice(),
+        [0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x38, 0x80].as_slice(),
+        [0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x00].as_slice(),
+        [0x00, 0x00, 0x00, 0x01, 0x09, 0x10].as_slice(),
+        [0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x11, 0x22].as_slice(),
+    ] {
+        raw.extend_from_slice(nal);
+    }
+    let units = split_h264_access_units(&raw);
+    assert_eq!(units.len(), 2);
+    let mut muxer = MuxerBuilder::new(Vec::<u8>::new())
+        .video(VideoCodec::H264, 640, 480, 30.0)
+        .build()
+        .unwrap();
+    let mut pts = 0.0;
+    for au in &units {
+        muxer.write_video(pts, au.data, au.is_keyframe).unwrap();
+        pts += 1.0 / 30.0;
+    }
+    muxer.finish().unwrap();
+}
+
+#[test]
+fn cmaf_segments_concatenate() {
+    use muxfin::cmaf::{CmafProfile, cmaf_styp};
+    use muxfin::fragmented::{FragmentConfig, FragmentedMuxer};
+    let config = FragmentConfig {
+        width: 1280,
+        height: 720,
+        timescale: 90_000,
+        fragment_duration_ms: 2000,
+        boundary: SegmentBoundary::Manual,
+        ..FragmentConfig::default()
+    };
+    CmafProfile::AvcHd.check_config(&config, None).unwrap();
+    let mut muxer = FragmentedMuxer::new(config);
+    let init = muxer.init_segment_cmaf(CmafProfile::AvcHd);
+    assert_eq!(&init[8..12], b"cmf2");
+    let data = vec![0x00, 0x00, 0x00, 0x04, 0x65, 0x01, 0x02, 0x03];
+    muxer.write_video(0, 0, &data, true).unwrap();
+    muxer.write_video(3000, 3000, &data, false).unwrap();
+    let seg = muxer.flush_cmaf_segment().unwrap();
+    assert_eq!(&seg[4..8], b"styp");
+    assert_eq!(&seg[8..12], b"msdh");
+    assert_eq!(cmaf_styp()[4..8], b"styp".to_owned().as_slice()[0..4]);
+    // init + segment is a well-formed byte stream (ftyp, moov, styp, moof, mdat).
+    let mut concat = init;
+    concat.extend_from_slice(&seg);
+    let types: Vec<[u8; 4]> = {
+        let mut v = Vec::new();
+        let mut pos = 0;
+        while pos + 8 <= concat.len() {
+            let size = u32::from_be_bytes(concat[pos..pos + 4].try_into().unwrap()) as usize;
+            v.push(concat[pos + 4..pos + 8].try_into().unwrap());
+            if size < 8 {
+                break;
+            }
+            pos += size;
+        }
+        v
+    };
+    assert_eq!(
+        types,
+        vec![*b"ftyp", *b"moov", *b"styp", *b"moof", *b"mdat"]
+    );
+}

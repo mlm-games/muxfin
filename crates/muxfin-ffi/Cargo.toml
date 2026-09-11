@@ -1,0 +1,16 @@
+[package]
+name = "muxfin-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stable C ABI for the muxfin MP4/Matroska muxer (opaque handles, integer status codes)."
+keywords = ["mp4", "video", "muxer", "ffi", "multimedia"]
+categories = ["multimedia", "multimedia::video", "external-ffi-bindings"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+muxfin.workspace = true

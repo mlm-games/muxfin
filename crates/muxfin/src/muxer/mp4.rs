@@ -79,7 +79,7 @@ pub struct Mp4SubtitleTrack {
     pub language: Option<String>,
 }
 
-struct SampleInfo {
+pub(crate) struct SampleInfo {
     pts: u64,
     dts: u64, // Decode time (for B-frames: dts != pts)
     data: Vec<u8>,
@@ -87,7 +87,39 @@ struct SampleInfo {
     duration: Option<u32>,
 }
 
-struct SampleTables {
+/// Metadata-only view of a sample for table building.
+///
+/// The seekable-streaming writer (§5) writes sample bytes straight to the
+/// output and retains only these descriptors, so RAM stays O(metadata)
+/// instead of O(media). `SampleTables::from_samples` consumes this type so
+/// buffered and streaming paths build identical tables.
+#[derive(Debug, Clone)]
+pub(crate) struct SampleMeta {
+    pub(crate) pts: u64,
+    pub(crate) dts: u64,
+    pub(crate) size: u32,
+    pub(crate) is_keyframe: bool,
+    pub(crate) duration: Option<u32>,
+}
+
+impl SampleInfo {
+    fn meta(&self) -> SampleMeta {
+        SampleMeta {
+            pts: self.pts,
+            dts: self.dts,
+            size: u32::try_from(self.data.len()).unwrap_or(u32::MAX),
+            is_keyframe: self.is_keyframe,
+            duration: self.duration,
+        }
+    }
+}
+
+/// Metadata-only projection of buffered samples for table building.
+pub(crate) fn sample_metas(samples: &[SampleInfo]) -> Vec<SampleMeta> {
+    samples.iter().map(SampleInfo::meta).collect()
+}
+
+pub(crate) struct SampleTables {
     durations: Vec<u32>,
     sizes: Vec<u32>,
     keyframes: Vec<u32>,
@@ -99,8 +131,8 @@ struct SampleTables {
 }
 
 impl SampleTables {
-    fn from_samples(
-        samples: &[SampleInfo],
+    pub(crate) fn from_samples(
+        samples: &[SampleMeta],
         chunk_offsets: Vec<u64>,
         samples_per_chunk: u32,
         fallback_duration: Option<u32>,
@@ -117,13 +149,7 @@ impl SampleTables {
             });
             durations.push(duration);
         }
-        let sizes: Vec<u32> = samples
-            .iter()
-            .map(|sample| {
-                u32::try_from(sample.data.len())
-                    .expect("sample larger than 4 GiB not supported in stsz")
-            })
-            .collect();
+        let sizes: Vec<u32> = samples.iter().map(|sample| sample.size).collect();
         let keyframes = samples
             .iter()
             .enumerate()
@@ -525,7 +551,6 @@ impl<Writer: Write> Mp4Writer<Writer> {
     pub(crate) fn video_sample_count(&self) -> u64 {
         self.video_samples.len() as u64
     }
-
     pub(crate) fn audio_sample_count(&self) -> u64 {
         self.audio_samples.len() as u64
     }
@@ -536,6 +561,33 @@ impl<Writer: Write> Mp4Writer<Writer> {
 
     pub(crate) fn bytes_written(&self) -> u64 {
         self.bytes_written
+    }
+
+    /// State accessors for the seekable-streaming writer (§5), which owns an
+    /// `Mp4Writer<io::Sink>` for validation/conversion and streams bytes
+    /// itself. Buffered behavior is unchanged.
+    pub(crate) fn video_config(&self) -> Option<&VideoConfig> {
+        self.video_config.as_ref()
+    }
+
+    pub(crate) fn audio_track_ref(&self) -> Option<&Mp4AudioTrack> {
+        self.audio_track.as_ref()
+    }
+
+    pub(crate) fn subtitle_track_ref(&self) -> Option<&Mp4SubtitleTrack> {
+        self.subtitle_track.as_ref()
+    }
+
+    pub(crate) fn video_last_delta(&self) -> Option<u32> {
+        self.video_last_delta
+    }
+
+    pub(crate) fn audio_last_delta(&self) -> Option<u32> {
+        self.audio_last_delta
+    }
+
+    pub(crate) fn subtitle_last_delta(&self) -> Option<u32> {
+        self.subtitle_last_delta
     }
 
     pub(crate) fn max_end_pts(&self) -> Option<u64> {
@@ -602,6 +654,34 @@ impl<Writer: Write> Mp4Writer<Writer> {
         data: &[u8],
         is_keyframe: bool,
     ) -> Result<(), Mp4WriterError> {
+        let converted = self.prepare_video_sample(pts, dts, data, is_keyframe)?;
+        // Back-patch the previous sample's duration from the observed delta,
+        // mirroring the pre-split behavior (prepare only records the delta).
+        if let Some(last) = self.video_samples.last_mut() {
+            last.duration = self.video_last_delta;
+        }
+        self.video_samples.push(SampleInfo {
+            pts,
+            dts,
+            data: converted,
+            is_keyframe,
+            duration: None,
+        });
+        Ok(())
+    }
+
+    /// Validate, convert (Annex B -> length-prefixed), and extract/check
+    /// decoder configuration for one video sample without buffering it.
+    ///
+    /// Shared by the buffered writer and the seekable-streaming writer (§5)
+    /// so both paths enforce identical semantics; only the sink differs.
+    pub(crate) fn prepare_video_sample(
+        &mut self,
+        _pts: u64,
+        dts: u64,
+        data: &[u8],
+        is_keyframe: bool,
+    ) -> Result<Vec<u8>, Mp4WriterError> {
         if self.finalized {
             return Err(Mp4WriterError::AlreadyFinalized);
         }
@@ -620,11 +700,7 @@ impl<Writer: Write> Mp4Writer<Writer> {
             if delta > u64::from(u32::MAX) {
                 return Err(Mp4WriterError::DurationOverflow);
             }
-            let delta = delta as u32;
-            if let Some(last) = self.video_samples.last_mut() {
-                last.duration = Some(delta);
-            }
-            self.video_last_delta = Some(delta);
+            self.video_last_delta = Some(delta as u32);
         } else {
             if !is_keyframe {
                 return Err(Mp4WriterError::FirstFrameMustBeKeyframe);
@@ -649,7 +725,9 @@ impl<Writer: Write> Mp4Writer<Writer> {
         }
         // Verdict §8: detect parameter-set changes after initialization.
         // Only keyframes can carry new PS; compare against stored config.
-        if is_keyframe && !self.video_samples.is_empty() {
+        // Gated on `video_prev_pts` (not buffer length) so the
+        // seekable-streaming writer (§5) enforces this identically.
+        if is_keyframe && self.video_prev_pts.is_some() {
             let changed = match (video_codec, &self.video_config) {
                 (VideoCodec::H264, Some(VideoConfig::Avc(old))) => extract_avc_config(data)
                     .is_some_and(|new| {
@@ -687,18 +765,37 @@ impl<Writer: Write> Mp4Writer<Writer> {
             return Err(Mp4WriterError::DurationOverflow);
         }
 
-        self.video_samples.push(SampleInfo {
-            pts,
-            dts,
-            data: converted,
-            is_keyframe,
-            duration: None,
-        });
         self.video_prev_pts = Some(dts); // Track DTS for monotonic check
-        Ok(())
+        Ok(converted)
     }
 
     pub fn write_audio_sample(&mut self, pts: u64, data: &[u8]) -> Result<(), Mp4WriterError> {
+        let sample_data = self.prepare_audio_sample(pts, data)?;
+        // Back-patch the previous sample's duration from the observed delta.
+        if let Some(last) = self.audio_samples.last_mut() {
+            last.duration = self.audio_last_delta;
+        }
+        self.audio_samples.push(SampleInfo {
+            pts,
+            dts: pts, // Audio: dts == pts (no B-frames)
+            data: sample_data,
+            is_keyframe: false,
+            duration: None,
+        });
+        Ok(())
+    }
+
+    /// Validate and convert one audio sample without buffering it.
+    ///
+    /// Shared by the buffered writer and the seekable-streaming writer (§5).
+    /// Updates `audio_prev_pts`/`audio_last_delta` but leaves duration
+    /// back-patching to the caller (buffered: previous `SampleInfo`;
+    /// streaming: previous `SampleMeta`).
+    pub(crate) fn prepare_audio_sample(
+        &mut self,
+        pts: u64,
+        data: &[u8],
+    ) -> Result<Vec<u8>, Mp4WriterError> {
         if self.finalized {
             return Err(Mp4WriterError::AlreadyFinalized);
         }
@@ -715,11 +812,7 @@ impl<Writer: Write> Mp4Writer<Writer> {
             if delta > u64::from(u32::MAX) {
                 return Err(Mp4WriterError::DurationOverflow);
             }
-            let delta = delta as u32;
-            if let Some(last) = self.audio_samples.last_mut() {
-                last.duration = Some(delta);
-            }
-            self.audio_last_delta = Some(delta);
+            self.audio_last_delta = Some(delta as u32);
         }
 
         // Process audio data based on codec
@@ -775,15 +868,8 @@ impl<Writer: Write> Mp4Writer<Writer> {
             return Err(Mp4WriterError::DurationOverflow);
         }
 
-        self.audio_samples.push(SampleInfo {
-            pts,
-            dts: pts, // Audio: dts == pts (no B-frames)
-            data: sample_data,
-            is_keyframe: false,
-            duration: None,
-        });
         self.audio_prev_pts = Some(pts);
-        Ok(())
+        Ok(sample_data)
     }
 
     pub fn write_subtitle_sample(
@@ -792,6 +878,27 @@ impl<Writer: Write> Mp4Writer<Writer> {
         duration: u32,
         data: &[u8],
     ) -> Result<(), Mp4WriterError> {
+        let (bytes, duration) = self.prepare_subtitle_sample(pts, duration, data)?;
+        self.subtitle_samples.push(SampleInfo {
+            pts,
+            dts: pts,
+            data: bytes,
+            is_keyframe: false,
+            duration: Some(duration),
+        });
+        Ok(())
+    }
+
+    /// Validate one subtitle sample without buffering it (§5).
+    ///
+    /// Returns the owned payload plus the effective duration (`max(1)`),
+    /// mirroring the buffered path exactly.
+    pub(crate) fn prepare_subtitle_sample(
+        &mut self,
+        pts: u64,
+        duration: u32,
+        data: &[u8],
+    ) -> Result<(Vec<u8>, u32), Mp4WriterError> {
         if self.finalized {
             return Err(Mp4WriterError::AlreadyFinalized);
         }
@@ -814,16 +921,9 @@ impl<Writer: Write> Mp4Writer<Writer> {
         }
 
         let duration = duration.max(1);
-        self.subtitle_samples.push(SampleInfo {
-            pts,
-            dts: pts,
-            data: data.to_vec(),
-            is_keyframe: false,
-            duration: Some(duration),
-        });
         self.subtitle_prev_pts = Some(pts);
         self.subtitle_last_delta = Some(duration);
-        Ok(())
+        Ok((data.to_vec(), duration))
     }
 
     /// Override the duration of the most recently queued video sample.
@@ -939,7 +1039,7 @@ impl<Writer: Write> Mp4Writer<Writer> {
             };
 
             let tables = SampleTables::from_samples(
-                &self.video_samples,
+                &sample_metas(&self.video_samples),
                 chunk_offsets,
                 samples_per_chunk,
                 self.video_last_delta,
@@ -1010,19 +1110,19 @@ impl<Writer: Write> Mp4Writer<Writer> {
         }
 
         let video_tables = SampleTables::from_samples(
-            &self.video_samples,
+            &sample_metas(&self.video_samples),
             video_chunk_offsets,
             1,
             self.video_last_delta,
         );
         let audio_tables = SampleTables::from_samples(
-            &self.audio_samples,
+            &sample_metas(&self.audio_samples),
             audio_chunk_offsets,
             1,
             self.audio_last_delta,
         );
         let subtitle_tables = SampleTables::from_samples(
-            &self.subtitle_samples,
+            &sample_metas(&self.subtitle_samples),
             subtitle_chunk_offsets,
             1,
             self.subtitle_last_delta,
@@ -1084,7 +1184,7 @@ impl<Writer: Write> Mp4Writer<Writer> {
             u32::try_from(self.audio_samples.len()).unwrap_or(u32::MAX)
         };
         let audio_tables = SampleTables::from_samples(
-            &self.audio_samples,
+            &sample_metas(&self.audio_samples),
             chunk_offsets,
             samples_per_chunk,
             self.audio_last_delta,
@@ -1104,7 +1204,7 @@ impl<Writer: Write> Mp4Writer<Writer> {
             vec![mdat_data_start]
         };
         let final_audio_tables = SampleTables::from_samples(
-            &self.audio_samples,
+            &sample_metas(&self.audio_samples),
             final_chunk_offsets,
             samples_per_chunk,
             self.audio_last_delta,
@@ -1114,7 +1214,7 @@ impl<Writer: Write> Mp4Writer<Writer> {
         if final_moov.len() as u64 != moov_len {
             let start2 = ftyp_len + final_moov.len() as u64 + mdat_header_size;
             let t2 = SampleTables::from_samples(
-                &self.audio_samples,
+                &sample_metas(&self.audio_samples),
                 if self.audio_samples.is_empty() {
                     Vec::new()
                 } else {
@@ -1207,19 +1307,19 @@ impl<Writer: Write> Mp4Writer<Writer> {
                 }
 
                 let video_tables = SampleTables::from_samples(
-                    &self.video_samples,
+                    &sample_metas(&self.video_samples),
                     video_offsets,
                     1,
                     self.video_last_delta,
                 );
                 let audio_tables = SampleTables::from_samples(
-                    &self.audio_samples,
+                    &sample_metas(&self.audio_samples),
                     audio_offsets,
                     1,
                     self.audio_last_delta,
                 );
                 let subtitle_tables = SampleTables::from_samples(
-                    &self.subtitle_samples,
+                    &sample_metas(&self.subtitle_samples),
                     subtitle_offsets,
                     1,
                     self.subtitle_last_delta,
@@ -1250,7 +1350,7 @@ impl<Writer: Write> Mp4Writer<Writer> {
                     u32::try_from(self.video_samples.len()).unwrap_or(u32::MAX)
                 };
                 let video_tables = SampleTables::from_samples(
-                    &self.video_samples,
+                    &sample_metas(&self.video_samples),
                     chunk_offsets,
                     samples_per_chunk,
                     self.video_last_delta,
@@ -1307,19 +1407,19 @@ impl<Writer: Write> Mp4Writer<Writer> {
             }
 
             let video_tables = SampleTables::from_samples(
-                &self.video_samples,
+                &sample_metas(&self.video_samples),
                 video_offsets,
                 1,
                 self.video_last_delta,
             );
             let audio_tables = SampleTables::from_samples(
-                &self.audio_samples,
+                &sample_metas(&self.audio_samples),
                 audio_offsets,
                 1,
                 self.audio_last_delta,
             );
             let subtitle_tables = SampleTables::from_samples(
-                &self.subtitle_samples,
+                &sample_metas(&self.subtitle_samples),
                 subtitle_offsets,
                 1,
                 self.subtitle_last_delta,
@@ -1350,7 +1450,7 @@ impl<Writer: Write> Mp4Writer<Writer> {
                 u32::try_from(self.video_samples.len()).unwrap_or(u32::MAX)
             };
             let video_tables = SampleTables::from_samples(
-                &self.video_samples,
+                &sample_metas(&self.video_samples),
                 chunk_offsets,
                 samples_per_chunk,
                 self.video_last_delta,
@@ -1730,7 +1830,7 @@ pub(crate) fn adts_to_raw(frame: &[u8]) -> Result<&[u8], AdtsValidationError> {
     Ok(&frame[header_len..aac_frame_length])
 }
 
-fn build_moov_box(
+pub(crate) fn build_moov_box(
     video: &Mp4VideoTrack,
     video_tables: &SampleTables,
     audio: Option<(&Mp4AudioTrack, &SampleTables)>,
@@ -1818,7 +1918,7 @@ fn build_moov_box(
     build_box(b"moov", &payload)
 }
 
-fn build_audio_only_moov_box(
+pub(crate) fn build_audio_only_moov_box(
     audio: &Mp4AudioTrack,
     audio_tables: &SampleTables,
     metadata: Option<&Metadata>,
@@ -3119,7 +3219,7 @@ fn build_tkhd_box_with_duration(
     build_box(b"tkhd", &payload)
 }
 
-fn build_ftyp_box() -> Vec<u8> {
+pub(crate) fn build_ftyp_box() -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(b"isom");
     payload.extend_from_slice(&0x200_u32.to_be_bytes());

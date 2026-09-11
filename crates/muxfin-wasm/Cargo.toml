@@ -1,0 +1,17 @@
+[package]
+name = "muxfin-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "WebAssembly bindings for the muxfin MP4 muxer (re-exports the stable muxfin-ffi ABI for wasm32 targets)."
+keywords = ["mp4", "video", "muxer", "wasm", "multimedia"]
+categories = ["multimedia", "multimedia::video", "wasm"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+muxfin.workspace = true
+muxfin-ffi = { path = "../muxfin-ffi", version = "0.2.2" }

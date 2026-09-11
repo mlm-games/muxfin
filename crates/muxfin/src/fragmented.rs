@@ -230,6 +230,31 @@ impl FragmentedMuxer {
         Some(segment)
     }
 
+    /// Flush all queued samples as a CMAF media segment (`styp` + `moof` +
+    /// `mdat`). Returns None if there are no samples to flush.
+    ///
+    /// The `styp` header (major `msdh`, compatible `msdh`/`msix`) is what
+    /// distinguishes a CMAF segment from a bare fMP4 fragment. Validate the
+    /// configuration first with
+    /// [`CmafProfile::check_config`](crate::cmaf::CmafProfile::check_config).
+    pub fn flush_cmaf_segment(&mut self) -> Option<Vec<u8>> {
+        let mut segment = crate::cmaf::cmaf_styp();
+        segment.extend_from_slice(&self.flush_segment()?);
+        Some(segment)
+    }
+
+    /// Get the CMAF initialization segment for a media profile.
+    ///
+    /// Identical `moov` to [`FragmentedMuxer::init_segment`], but the `ftyp`
+    /// advertises major brand `cmf2` plus the profile brand instead of the
+    /// generic `iso5` set. Cached per muxer like the plain init segment.
+    pub fn init_segment_cmaf(&mut self, profile: crate::cmaf::CmafProfile) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&build_ftyp_cmaf(profile));
+        buf.extend_from_slice(&build_moov_fmp4(&self.config));
+        buf
+    }
+
     /// Check if we have enough samples to make a fragment.
     ///
     /// With `SegmentBoundary::Manual` this always returns false (caller
@@ -301,6 +326,13 @@ fn build_ftyp_fmp4() -> Vec<u8> {
     payload.extend_from_slice(b"iso6");
     payload.extend_from_slice(b"mp41");
     build_box(b"ftyp", &payload)
+}
+
+/// CMAF init-segment `ftyp` for a media profile: major `cmf2` plus the
+/// profile brand. Delegates byte layout to [`crate::cmaf::cmaf_init_ftyp`]
+/// so brand tables cannot drift between modules.
+fn build_ftyp_cmaf(profile: crate::cmaf::CmafProfile) -> Vec<u8> {
+    crate::cmaf::cmaf_init_ftyp(profile)
 }
 
 fn build_moov_fmp4(config: &FragmentConfig) -> Vec<u8> {

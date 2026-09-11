@@ -61,6 +61,9 @@ pub mod time;
 // Fragmented MP4 support for streaming applications
 pub mod fragmented;
 
+// CMAF media profiles and segment framing (ISO/IEC 23000-19)
+pub mod cmaf;
+
 // Codec configuration extraction (minimal bitstream parsing)
 pub mod codec;
 

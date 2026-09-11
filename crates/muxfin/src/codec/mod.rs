@@ -21,6 +21,7 @@
 //!
 //! The muxer internally converts to length-prefixed format (AVCC/HVCC) for MP4.
 
+pub mod access_unit;
 pub mod av1;
 pub mod common;
 pub mod flac;
@@ -36,4 +37,6 @@ pub use flac::{
 };
 pub use h264::{AvcConfig, annexb_to_avcc, extract_avc_config, is_h264_keyframe};
 pub use h265::{HevcConfig, extract_hevc_config, hevc_annexb_to_hvcc, is_hevc_keyframe};
-pub use opus::{OPUS_SAMPLE_RATE, OpusConfig, is_valid_opus_packet, opus_packet_samples};
+pub use opus::{
+    OPUS_SAMPLE_RATE, OpusConfig, OpusConfigError, is_valid_opus_packet, opus_packet_samples,
+};
