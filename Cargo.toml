@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*", "apps/*"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.98"
 license = "MPL-2.0"
@@ -25,7 +25,7 @@ proptest = "1"
 tempfile = "3"
 criterion = "0.5"
 
-muxfin = { path = "crates/muxfin", version = "0.2.2" }
+muxfin = { path = "crates/muxfin", version = "0.2.3" }
 
 [profile.release]
 lto = "thin"

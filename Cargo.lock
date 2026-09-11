@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "muxfin"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "muxfin-cli"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "clap",
