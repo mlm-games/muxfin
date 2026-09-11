@@ -83,6 +83,10 @@ pub enum AudioCodec {
     /// Opus audio codec. Raw Opus packets (no container framing).
     /// Sample rate is always 48kHz per Opus spec.
     Opus,
+    /// FLAC (Free Lossless Audio Codec). Native FLAC frames (one frame
+    /// per MP4 sample). Requires STREAMINFO via
+    /// [`MuxerBuilder::with_flac_streaminfo`].
+    Flac,
     /// No audio.  Use this variant when only video is being muxed.
     None,
 }
@@ -99,6 +103,7 @@ impl fmt::Display for AudioCodec {
         match self {
             AudioCodec::Aac(profile) => write!(f, "AAC-{}", profile),
             AudioCodec::Opus => write!(f, "Opus"),
+            AudioCodec::Flac => write!(f, "FLAC"),
             AudioCodec::None => write!(f, "None"),
         }
     }
@@ -137,6 +142,7 @@ impl std::str::FromStr for AudioCodec {
             "aac-he" => Ok(AudioCodec::Aac(AacProfile::He)),
             "aac-hev2" => Ok(AudioCodec::Aac(AacProfile::Hev2)),
             "opus" => Ok(AudioCodec::Opus),
+            "flac" => Ok(AudioCodec::Flac),
             "none" => Ok(AudioCodec::None),
             _ => Err(format!("Unknown audio codec: {}", s)),
         }
@@ -337,6 +343,10 @@ pub struct MuxerBuilder<Writer> {
     av1_sequence_header: Option<Vec<u8>>,
     /// VP9 configuration for fragmented MP4.
     vp9_config: Option<crate::codec::vp9::Vp9Config>,
+    /// FLAC STREAMINFO (34 bytes) for FLAC audio tracks.
+    flac_streaminfo: Option<Vec<u8>>,
+    /// Opus pre-skip override (48 kHz samples) for Opus audio tracks.
+    opus_preskip: Option<u16>,
     /// Output container selected for [`MuxerBuilder::build_mkv`].
     container: ContainerFormat,
 }
@@ -356,6 +366,8 @@ impl<Writer> MuxerBuilder<Writer> {
             vps: None,
             av1_sequence_header: None,
             vp9_config: None,
+            flac_streaminfo: None,
+            opus_preskip: None,
             container: ContainerFormat::Mp4,
         }
     }
@@ -437,6 +449,27 @@ impl<Writer> MuxerBuilder<Writer> {
         self
     }
 
+    /// Set the FLAC STREAMINFO block (34 raw bytes) for FLAC audio tracks.
+    ///
+    /// Required when the audio codec is [`AudioCodec::Flac`]: the MP4
+    /// `dfLa` box and the Matroska `A_FLAC` CodecPrivate are built from
+    /// it. Obtain it from [`crate::demux::FlacStream::streaminfo_raw`]
+    /// or any native FLAC file's first metadata block.
+    pub fn with_flac_streaminfo(mut self, streaminfo: Vec<u8>) -> Self {
+        self.flac_streaminfo = Some(streaminfo);
+        self
+    }
+
+    /// Override the Opus pre-skip signalled in `dOps`/`OpusHead`.
+    ///
+    /// Defaults to 312 samples when unset. Set it from
+    /// [`crate::demux::OggOpusTrack::pre_skip`] when remuxing Ogg Opus
+    /// so players skip exactly the encoder delay.
+    pub fn with_opus_preskip(mut self, pre_skip: u16) -> Self {
+        self.opus_preskip = Some(pre_skip);
+        self
+    }
+
     /// Set creation time for the media file
     pub fn set_create_time(mut self, unix_timestamp: u64) -> Self {
         self.metadata
@@ -509,6 +542,36 @@ impl<Writer> MuxerBuilder<Writer> {
             return Err(MuxerError::MissingConfig);
         }
 
+        if let Some(audio) = &audio_track
+            && audio.codec == AudioCodec::Flac
+        {
+            let info = self.flac_streaminfo.as_ref().ok_or_else(|| {
+                MuxerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "FLAC STREAMINFO must be provided for FLAC audio using with_flac_streaminfo()",
+                ))
+            })?;
+            let parsed = crate::codec::flac::parse_streaminfo(info).ok_or_else(|| {
+                MuxerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "FLAC STREAMINFO must be a valid 34-byte STREAMINFO block",
+                ))
+            })?;
+            // The track parameters must agree with STREAMINFO (the MP4
+            // sample entry carries the STREAMINFO values).
+            if audio.sample_rate != parsed.sample_rate
+                || audio.channels != u16::from(parsed.channels)
+            {
+                return Err(MuxerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "FLAC track parameters ({} Hz, {} ch) disagree with STREAMINFO ({} Hz, {} ch)",
+                        audio.sample_rate, audio.channels, parsed.sample_rate, parsed.channels
+                    ),
+                )));
+            }
+        }
+
         let mut writer = Mp4Writer::new(self.writer);
         if let Some(ref video) = video_track {
             writer.enable_video(video.codec);
@@ -518,6 +581,8 @@ impl<Writer> MuxerBuilder<Writer> {
                 sample_rate: audio.sample_rate,
                 channels: audio.channels,
                 codec: audio.codec,
+                flac_streaminfo: self.flac_streaminfo.clone(),
+                opus_preskip: self.opus_preskip,
             });
         }
         if let Some(subtitle) = &subtitle_track {
@@ -696,6 +761,42 @@ impl<Writer> MuxerBuilder<Writer> {
             return Err(MuxerError::MissingConfig);
         }
 
+        if let Some(audio) = &audio_track
+            && audio.codec == AudioCodec::Flac
+        {
+            let parsed = crate::codec::flac::parse_streaminfo(
+                self.flac_streaminfo.as_deref().unwrap_or(&[]),
+            )
+            .ok_or_else(|| {
+                MuxerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "valid FLAC STREAMINFO (34 bytes) must be provided for FLAC audio using with_flac_streaminfo()",
+                ))
+            })?;
+            if audio.sample_rate != parsed.sample_rate
+                || audio.channels != u16::from(parsed.channels)
+            {
+                return Err(MuxerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "FLAC track parameters ({} Hz, {} ch) disagree with STREAMINFO ({} Hz, {} ch)",
+                        audio.sample_rate, audio.channels, parsed.sample_rate, parsed.channels
+                    ),
+                )));
+            }
+        }
+
+        if container == MkvContainer::WebM
+            && let Some(audio) = &audio_track
+            && audio.codec == AudioCodec::Flac
+        {
+            return Err(MuxerError::UnsupportedForContainer {
+                codec: audio.codec.to_string(),
+                container: container.to_string(),
+                reason: "WebM only supports Opus audio; use Matroska (.mkv) for FLAC".to_string(),
+            });
+        }
+
         let mut writer = MkvWriter::new(self.writer);
         if let Some(ref video) = video_track {
             writer.enable_video(video.codec);
@@ -705,6 +806,8 @@ impl<Writer> MuxerBuilder<Writer> {
                 sample_rate: audio.sample_rate,
                 channels: audio.channels,
                 codec: audio.codec,
+                flac_streaminfo: self.flac_streaminfo.clone(),
+                opus_preskip: self.opus_preskip,
             });
         }
         if let Some(subtitle) = &subtitle_track {
@@ -883,6 +986,8 @@ pub enum MuxerError {
     },
     /// Audio sample is not a valid Opus packet.
     InvalidOpusPacket { frame_index: u64 },
+    /// Audio sample is not a valid FLAC frame.
+    InvalidFlacFrame { frame_index: u64 },
     /// DTS must be monotonically increasing.
     NonIncreasingDts {
         prev_dts: f64,
@@ -1123,6 +1228,13 @@ impl fmt::Display for MuxerError {
                     frame_index
                 )
             }
+            MuxerError::InvalidFlacFrame { frame_index } => {
+                write!(
+                    f,
+                    "audio frame {} is not a valid FLAC frame: ensure the frame starts with the 0xFFF8/0xFFF9 sync",
+                    frame_index
+                )
+            }
             MuxerError::NonIncreasingDts {
                 prev_dts,
                 curr_dts,
@@ -1314,6 +1426,11 @@ impl<Writer: Write> Muxer<Writer> {
                 MuxerError::InvalidAdtsDetailed { frame_index, error }
             }
             Mp4WriterError::InvalidOpusPacket => MuxerError::InvalidOpusPacket { frame_index },
+            Mp4WriterError::InvalidFlacFrame => MuxerError::InvalidFlacFrame { frame_index },
+            Mp4WriterError::MissingFlacStreaminfo => MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "FLAC STREAMINFO must be provided using with_flac_streaminfo()",
+            )),
             Mp4WriterError::AudioNotEnabled => MuxerError::AudioNotConfigured,
             Mp4WriterError::SubtitleNotEnabled => MuxerError::SubtitleNotConfigured,
             Mp4WriterError::DurationOverflow => MuxerError::Io(std::io::Error::new(
@@ -1768,6 +1885,11 @@ impl<Writer: Write> MkvMuxer<Writer> {
                 MuxerError::InvalidAdtsDetailed { frame_index, error }
             }
             MkvWriterError::InvalidOpusPacket => MuxerError::InvalidOpusPacket { frame_index },
+            MkvWriterError::InvalidFlacFrame => MuxerError::InvalidFlacFrame { frame_index },
+            MkvWriterError::MissingFlacStreaminfo => MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "FLAC STREAMINFO must be provided using with_flac_streaminfo()",
+            )),
             MkvWriterError::AudioNotEnabled => MuxerError::AudioNotConfigured,
             MkvWriterError::SubtitleNotEnabled => MuxerError::SubtitleNotConfigured,
             MkvWriterError::DurationOverflow => MuxerError::Io(std::io::Error::new(

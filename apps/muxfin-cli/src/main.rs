@@ -11,6 +11,7 @@ use muxfin::api::{
     AacProfile, AudioCodec, ContainerFormat, Metadata, MkvMuxer, Muxer, MuxerBuilder, VideoCodec,
 };
 use muxfin::assert_invariant;
+use muxfin::demux::{FlacStream, OggOpusTrack, demux_flac, demux_ogg_opus};
 
 fn read_hex_bytes(contents: &str) -> Vec<u8> {
     let hex: String = contents.chars().filter(|c| !c.is_whitespace()).collect();
@@ -27,7 +28,8 @@ fn read_hex_bytes(contents: &str) -> Vec<u8> {
 /// Muxfin - Minimal-dependency pure-Rust MP4 muxer
 ///
 /// A professional-grade MP4 muxer designed for recording applications.
-/// Supports H.264/H.265/AV1/VP9 video and AAC/Opus audio with world-class error handling.
+/// Supports H.264/H.265/AV1/VP9 video and AAC/Opus/FLAC audio with world-class error handling.
+/// Audio inputs may be raw frame dumps, Ogg Opus (.ogg/.opus) or native FLAC (.flac).
 #[derive(Parser)]
 #[command(name = "muxfin")]
 #[command(version, about, long_about)]
@@ -334,8 +336,13 @@ fn mux_command(
         );
     }
 
-    // Invariant: CLI must validate audio parameters when audio is specified
-    if audio.is_some() {
+    // Invariant: CLI must validate audio parameters when audio is specified.
+    // Container inputs (Ogg Opus, FLAC) carry their own parameters, so
+    // explicit --sample-rate/--channels are only required for raw input.
+    let audio_is_container = audio
+        .as_ref()
+        .is_some_and(|path| detect_audio_container(path).is_some());
+    if audio.is_some() && !audio_is_container {
         assert_invariant!(
             sample_rate.is_some() && channels.is_some(),
             "Audio parameters must be complete when audio input is provided",
@@ -396,7 +403,14 @@ fn mux_command(
 
     // Store paths for later use
     let video_path = video.clone();
-    let audio_path = audio.clone();
+
+    // Load audio input once: containers (.ogg/.opus/.flac) are demuxed,
+    // everything else keeps the legacy raw-hex frame path.
+    let audio_input: Option<AudioInput> = audio
+        .as_ref()
+        .map(load_audio_input)
+        .transpose()
+        .with_context(|| "Failed to load audio input")?;
 
     // Create output file
     let output_file = File::create(&output)
@@ -450,43 +464,82 @@ fn mux_command(
     }
 
     // Configure audio if provided
-    if let (Some(_audio), Some(sample_rate), Some(channels)) = (&audio, sample_rate, channels) {
-        let codec = audio_codec.unwrap_or(AudioCodec::Aac(AacProfile::Lc)); // Default to AAC LC
+    if let Some(input) = &audio_input {
+        let (codec, rate, chs) = match input {
+            AudioInput::OggOpus(track) => {
+                if let Some(flag) = audio_codec
+                    && flag != AudioCodec::Opus
+                {
+                    anyhow::bail!("--audio-codec {flag} conflicts with Ogg Opus input");
+                }
+                (
+                    AudioCodec::Opus,
+                    sample_rate.unwrap_or(48_000),
+                    channels.map(u16::from).unwrap_or(u16::from(track.channels)),
+                )
+            }
+            AudioInput::Flac(stream) => {
+                if let Some(flag) = audio_codec
+                    && flag != AudioCodec::Flac
+                {
+                    anyhow::bail!("--audio-codec {flag} conflicts with FLAC input");
+                }
+                (
+                    AudioCodec::Flac,
+                    sample_rate.unwrap_or(stream.streaminfo.sample_rate),
+                    channels
+                        .map(u16::from)
+                        .unwrap_or(u16::from(stream.streaminfo.channels)),
+                )
+            }
+            AudioInput::RawHex(_) => {
+                if sample_rate.is_none() || channels.is_none() {
+                    anyhow::bail!(
+                        "--sample-rate and --channels are required for raw audio input (not needed for .ogg/.flac)"
+                    );
+                }
+                (
+                    audio_codec.unwrap_or(AudioCodec::Aac(AacProfile::Lc)),
+                    sample_rate.unwrap_or(0),
+                    channels.map(u16::from).unwrap_or(0),
+                )
+            }
+        };
 
         // Invariant: Audio codec must be supported
         assert_invariant!(
-            matches!(codec, AudioCodec::Aac(_) | AudioCodec::Opus),
+            matches!(
+                codec,
+                AudioCodec::Aac(_) | AudioCodec::Opus | AudioCodec::Flac
+            ),
             "Audio codec must be one of the supported variants",
             "cli::mux_command"
         );
 
-        builder = builder.audio(codec, sample_rate, channels as u16);
+        builder = builder.audio(codec, rate, chs);
+        if let AudioInput::Flac(stream) = input {
+            builder = builder.with_flac_streaminfo(stream.streaminfo_raw.to_vec());
+        }
+        if let AudioInput::OggOpus(track) = input {
+            builder = builder.with_opus_preskip(track.pre_skip);
+        }
 
         // Invariant: Audio sample rate must be reasonable
         assert_invariant!(
-            sample_rate > 0 && sample_rate <= 192000,
+            rate > 0 && rate <= 192000,
             "Audio sample rate must be positive and within reasonable limits",
             "cli::mux_command"
         );
 
         // Invariant: Audio channels must be reasonable
         assert_invariant!(
-            channels > 0 && channels <= 8,
+            chs > 0 && chs <= 8,
             "Audio channels must be positive and within reasonable limits",
             "cli::mux_command"
         );
 
         if verbose {
-            eprintln!(
-                "Configured audio: {} {}Hz {}ch",
-                match codec {
-                    AudioCodec::Aac(profile) => format!("AAC-{}", profile),
-                    AudioCodec::Opus => "Opus".to_string(),
-                    AudioCodec::None => "None".to_string(),
-                },
-                sample_rate,
-                channels
-            );
+            eprintln!("Configured audio: {codec} {rate}Hz {chs}ch");
         }
     }
 
@@ -516,8 +569,8 @@ fn mux_command(
         }
 
         // Process audio frames
-        if let Some(audio_path) = audio_path {
-            process_audio_frames(&audio_path, &mut muxer, &mut progress, verbose)?;
+        if let Some(input) = &audio_input {
+            process_audio_frames(input, &mut muxer, &mut progress, verbose)?;
         }
 
         // Finalize muxing
@@ -551,8 +604,8 @@ fn mux_command(
         }
 
         // Process audio frames
-        if let Some(audio_path) = audio_path {
-            process_audio_frames(&audio_path, &mut muxer, &mut progress, verbose)?;
+        if let Some(input) = &audio_input {
+            process_audio_frames(input, &mut muxer, &mut progress, verbose)?;
         }
 
         // Finalize muxing
@@ -661,33 +714,108 @@ fn process_video_frames(
     Ok(())
 }
 
+/// Audio input after loading: either a legacy raw-hex frame dump or a
+/// demuxed modern container (Ogg Opus, native FLAC).
+enum AudioInput {
+    RawHex(Vec<u8>),
+    OggOpus(OggOpusTrack),
+    Flac(FlacStream),
+}
+
+/// Supported container inputs, detected by magic bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AudioContainer {
+    Ogg,
+    Flac,
+}
+
+fn detect_audio_container(path: &PathBuf) -> Option<AudioContainer> {
+    let file = File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    std::io::Read::read_exact(&mut BufReader::new(file), &mut magic).ok()?;
+    if &magic == b"OggS" {
+        Some(AudioContainer::Ogg)
+    } else if &magic == b"fLaC" {
+        Some(AudioContainer::Flac)
+    } else {
+        None
+    }
+}
+
+fn load_audio_input(audio_path: &PathBuf) -> Result<AudioInput> {
+    match detect_audio_container(audio_path) {
+        Some(AudioContainer::Ogg) => {
+            let bytes = std::fs::read(audio_path)
+                .with_context(|| format!("Failed to read audio file: {}", audio_path.display()))?;
+            demux_ogg_opus(&bytes)
+                .map(AudioInput::OggOpus)
+                .map_err(|e| anyhow::anyhow!("Failed to demux Ogg audio: {e}"))
+        }
+        Some(AudioContainer::Flac) => {
+            let bytes = std::fs::read(audio_path)
+                .with_context(|| format!("Failed to read audio file: {}", audio_path.display()))?;
+            demux_flac(&bytes)
+                .map(AudioInput::Flac)
+                .map_err(|e| anyhow::anyhow!("Failed to demux FLAC audio: {e}"))
+        }
+        None => {
+            let file = File::open(audio_path)
+                .with_context(|| format!("Failed to open audio file: {}", audio_path.display()))?;
+            let mut reader = BufReader::new(file);
+            let mut hex_content = String::new();
+            reader
+                .read_to_string(&mut hex_content)
+                .with_context(|| "Failed to read audio data")?;
+            // Convert hex string to bytes
+            Ok(AudioInput::RawHex(read_hex_bytes(&hex_content)))
+        }
+    }
+}
+
 fn process_audio_frames(
-    audio_path: &PathBuf,
+    input: &AudioInput,
     muxer: &mut dyn MediaSink,
     progress: &mut ProgressReporter,
     verbose: bool,
 ) -> Result<()> {
-    if verbose {
-        eprintln!("Processing audio frames from: {}", audio_path.display());
+    match input {
+        AudioInput::RawHex(data) => {
+            // Write the frame at time 0
+            muxer.push_audio(0.0, data)?;
+            progress.update_audio_frame();
+            progress.update_bytes(data.len() as u64);
+        }
+        AudioInput::OggOpus(track) => {
+            if verbose {
+                eprintln!(
+                    "Demuxed Ogg Opus: {} packets, {} ch, pre-skip {}",
+                    track.packets.len(),
+                    track.channels,
+                    track.pre_skip
+                );
+            }
+            for packet in &track.packets {
+                muxer.push_audio(packet.pts, &packet.data)?;
+                progress.update_audio_frame();
+                progress.update_bytes(packet.data.len() as u64);
+            }
+        }
+        AudioInput::Flac(stream) => {
+            if verbose {
+                eprintln!(
+                    "Demuxed FLAC: {} frames, {} Hz, {} ch",
+                    stream.frames.len(),
+                    stream.streaminfo.sample_rate,
+                    stream.streaminfo.channels
+                );
+            }
+            for frame in &stream.frames {
+                muxer.push_audio(frame.pts, &frame.data)?;
+                progress.update_audio_frame();
+                progress.update_bytes(frame.data.len() as u64);
+            }
+        }
     }
-
-    let file = File::open(audio_path)
-        .with_context(|| format!("Failed to open audio file: {}", audio_path.display()))?;
-
-    let mut reader = BufReader::new(file);
-    let mut hex_content = String::new();
-    reader
-        .read_to_string(&mut hex_content)
-        .with_context(|| "Failed to read audio data")?;
-
-    // Convert hex string to bytes
-    let data = read_hex_bytes(&hex_content);
-
-    // Write the frame at time 0
-    muxer.push_audio(0.0, &data)?;
-
-    progress.update_audio_frame();
-    progress.update_bytes(data.len() as u64);
 
     Ok(())
 }
@@ -745,8 +873,9 @@ fn validate_command(
             }));
             is_valid = false;
         } else {
-            // Try to read and validate hex content
-            match validate_hex_file(audio_path, "audio") {
+            // Container inputs (Ogg/FLAC) are demuxed; everything else
+            // must be a raw hex frame dump.
+            match validate_audio_file(audio_path) {
                 Ok(msg) => checks.push(serde_json::json!({
                     "type": "audio_file",
                     "status": "success",
@@ -804,6 +933,36 @@ fn validate_command(
     }
 
     Ok(())
+}
+
+fn validate_audio_file(path: &PathBuf) -> Result<String> {
+    match detect_audio_container(path) {
+        Some(AudioContainer::Ogg) => {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("Failed to read audio file: {}", path.display()))?;
+            let track =
+                demux_ogg_opus(&bytes).map_err(|e| anyhow::anyhow!("Ogg demux failed: {e}"))?;
+            Ok(format!(
+                "Ogg Opus audio is valid ({} packets, {} ch, {:.2}s)",
+                track.packets.len(),
+                track.channels,
+                track.duration
+            ))
+        }
+        Some(AudioContainer::Flac) => {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("Failed to read audio file: {}", path.display()))?;
+            let stream =
+                demux_flac(&bytes).map_err(|e| anyhow::anyhow!("FLAC demux failed: {e}"))?;
+            Ok(format!(
+                "FLAC audio is valid ({} frames, {} Hz, {} ch)",
+                stream.frames.len(),
+                stream.streaminfo.sample_rate,
+                stream.streaminfo.channels
+            ))
+        }
+        None => validate_hex_file(path, "audio"),
+    }
 }
 
 fn validate_hex_file(path: &PathBuf, file_type: &str) -> Result<String> {
@@ -869,6 +1028,14 @@ fn info_command(input: PathBuf, verbose: bool, json: bool) -> Result<()> {
     // with the external mkv-element crate.
     if buffer.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
         return info_matroska_command(&input, &buffer, verbose, json);
+    }
+
+    // Ogg and native FLAC inputs are demuxed with the built-in demuxers.
+    if buffer.starts_with(b"OggS") {
+        return info_audio_container_command(&input, &buffer, verbose, json);
+    }
+    if buffer.starts_with(b"fLaC") {
+        return info_audio_container_command(&input, &buffer, verbose, json);
     }
 
     if buffer.len() < 8 {
@@ -951,6 +1118,83 @@ fn info_command(input: PathBuf, verbose: bool, json: bool) -> Result<()> {
             let typ = box_info["type"].as_str().unwrap();
             let size = box_info["size"].as_u64().unwrap();
             println!("  {}: {} bytes", typ, size);
+        }
+    }
+
+    Ok(())
+}
+
+/// Inspect an Ogg Opus or native FLAC file using the built-in demuxers.
+fn info_audio_container_command(
+    input: &PathBuf,
+    buffer: &[u8],
+    verbose: bool,
+    json: bool,
+) -> Result<()> {
+    let info = if buffer.starts_with(b"OggS") {
+        match demux_ogg_opus(buffer) {
+            Ok(track) => serde_json::json!({
+                "file": input.display().to_string(),
+                "file_size": buffer.len(),
+                "container": "Ogg",
+                "audio_codec": "Opus",
+                "channels": track.channels,
+                "sample_rate": 48000,
+                "pre_skip": track.pre_skip,
+                "packets": track.packets.len(),
+                "duration_secs": track.duration,
+            }),
+            Err(e) => serde_json::json!({
+                "file": input.display().to_string(),
+                "container": "Ogg",
+                "error": e.to_string(),
+            }),
+        }
+    } else {
+        match demux_flac(buffer) {
+            Ok(stream) => serde_json::json!({
+                "file": input.display().to_string(),
+                "file_size": buffer.len(),
+                "container": "FLAC",
+                "audio_codec": "FLAC",
+                "channels": stream.streaminfo.channels,
+                "sample_rate": stream.streaminfo.sample_rate,
+                "bits_per_sample": stream.streaminfo.bits_per_sample,
+                "frames": stream.frames.len(),
+            }),
+            Err(e) => serde_json::json!({
+                "file": input.display().to_string(),
+                "container": "FLAC",
+                "error": e.to_string(),
+            }),
+        }
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&info)?);
+    } else if let Some(error) = info.get("error").and_then(|e| e.as_str()) {
+        println!("File: {}", input.display());
+        println!("Demux error: {}", error);
+    } else {
+        println!("File: {}", input.display());
+        println!("Size: {} bytes", buffer.len());
+        println!("Container: {}", info["container"].as_str().unwrap_or("?"));
+        println!(
+            "Audio Codec: {}",
+            info["audio_codec"].as_str().unwrap_or("?")
+        );
+        println!(
+            "Format: {} Hz, {} ch",
+            info["sample_rate"], info["channels"]
+        );
+        if let Some(packets) = info.get("packets").and_then(|v| v.as_u64()) {
+            println!("Packets: {}", packets);
+        }
+        if let Some(frames) = info.get("frames").and_then(|v| v.as_u64()) {
+            println!("Frames: {}", frames);
+        }
+        if verbose {
+            println!("Details: {}", serde_json::to_string(&info)?);
         }
     }
 

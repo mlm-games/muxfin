@@ -135,7 +135,7 @@ pub fn validate_audio_config(
 
     // Check codec support
     match codec {
-        AudioCodec::Aac(_) | AudioCodec::Opus => {
+        AudioCodec::Aac(_) | AudioCodec::Opus | AudioCodec::Flac => {
             result = result.with_message(format!("✓ Audio codec {} is supported", codec));
         }
         AudioCodec::None => {
@@ -238,6 +238,13 @@ pub fn validate_audio_frame(codec: AudioCodec, frame_data: &[u8]) -> ValidationR
                 result = result.with_error("Invalid Opus packet structure".to_string());
             } else {
                 result = result.with_message("✓ Opus packet has valid structure".to_string());
+            }
+        }
+        AudioCodec::Flac => {
+            if !crate::codec::flac::is_valid_flac_frame(frame_data) {
+                result = result.with_error("Invalid FLAC frame sync".to_string());
+            } else {
+                result = result.with_message("✓ FLAC frame has valid header".to_string());
             }
         }
         AudioCodec::None => {

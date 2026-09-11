@@ -4,6 +4,7 @@ use std::io::{self, Write};
 use crate::api::{AacProfile, AudioCodec, Metadata, SubtitleCodec, VideoCodec};
 use crate::assert_invariant;
 use crate::codec::av1::{Av1Config, extract_av1_config};
+use crate::codec::flac::{STREAMINFO_LEN, is_valid_flac_frame, parse_streaminfo};
 use crate::codec::h264::{AvcConfig, annexb_to_avcc, default_avc_config, extract_avc_config};
 use crate::codec::h265::{HevcConfig, extract_hevc_config, hevc_annexb_to_hvcc};
 use crate::codec::opus::{OPUS_SAMPLE_RATE, OpusConfig, is_valid_opus_packet};
@@ -58,6 +59,10 @@ pub struct Mp4AudioTrack {
     pub sample_rate: u32,
     pub channels: u16,
     pub codec: AudioCodec,
+    /// 34-byte STREAMINFO block for FLAC tracks; `None` otherwise.
+    pub flac_streaminfo: Option<Vec<u8>>,
+    /// Opus pre-skip in 48 kHz samples; `None` selects the 312 default.
+    pub opus_preskip: Option<u16>,
 }
 
 pub struct Mp4SubtitleTrack {
@@ -385,6 +390,10 @@ pub enum Mp4WriterError {
     InvalidAdtsDetailed(Box<AdtsValidationError>),
     /// Audio sample is not a valid Opus packet.
     InvalidOpusPacket,
+    /// Audio sample is not a valid FLAC frame.
+    InvalidFlacFrame,
+    /// FLAC track is missing its STREAMINFO configuration.
+    MissingFlacStreaminfo,
     /// Audio track is not enabled on this writer.
     AudioNotEnabled,
     /// Subtitle track is not enabled on this writer.
@@ -416,6 +425,10 @@ impl fmt::Display for Mp4WriterError {
             Mp4WriterError::InvalidAdts => write!(f, "invalid ADTS frame"),
             Mp4WriterError::InvalidAdtsDetailed(err) => write!(f, "{}", err),
             Mp4WriterError::InvalidOpusPacket => write!(f, "invalid Opus packet"),
+            Mp4WriterError::InvalidFlacFrame => write!(f, "invalid FLAC frame"),
+            Mp4WriterError::MissingFlacStreaminfo => {
+                write!(f, "FLAC track is missing its STREAMINFO configuration")
+            }
             Mp4WriterError::AudioNotEnabled => write!(f, "audio track not enabled"),
             Mp4WriterError::SubtitleNotEnabled => write!(f, "subtitle track not enabled"),
             Mp4WriterError::DurationOverflow => write!(f, "sample duration overflow"),
@@ -639,6 +652,20 @@ impl<Writer: Write> Mp4Writer<Writer> {
                     return Err(Mp4WriterError::InvalidOpusPacket);
                 }
                 // Opus packets are passed through as-is (no container framing)
+                data.to_vec()
+            }
+            AudioCodec::Flac => {
+                // STREAMINFO must be configured up front (the `dfLa`
+                // box is built from it at finalize time).
+                if parse_streaminfo(audio_track.flac_streaminfo.as_deref().unwrap_or(&[])).is_none()
+                {
+                    return Err(Mp4WriterError::MissingFlacStreaminfo);
+                }
+                // FLAC frames are passed through as-is (one frame per sample);
+                // only the header sync is validated here.
+                if !is_valid_flac_frame(data) {
+                    return Err(Mp4WriterError::InvalidFlacFrame);
+                }
                 data.to_vec()
             }
             AudioCodec::None => {
@@ -1838,6 +1865,7 @@ fn build_audio_stsd_box(audio: &Mp4AudioTrack) -> Vec<u8> {
     let sample_entry_box = match audio.codec {
         AudioCodec::Aac(_) => build_mp4a_box(audio),
         AudioCodec::Opus => build_opus_box(audio),
+        AudioCodec::Flac => build_flac_box(audio),
         AudioCodec::None => build_mp4a_box(audio), // Fallback, shouldn't happen
     };
 
@@ -2015,7 +2043,9 @@ fn build_opus_box(audio: &Mp4AudioTrack) -> Vec<u8> {
 ///   - CoupledCount (1 byte)
 ///   - ChannelMapping (OutputChannelCount bytes)
 fn build_dops_box(audio: &Mp4AudioTrack) -> Vec<u8> {
-    let config = OpusConfig::default().with_channels(audio.channels as u8);
+    let config = OpusConfig::default()
+        .with_channels(audio.channels as u8)
+        .with_pre_skip(audio.opus_preskip.unwrap_or(312));
 
     let mut payload = Vec::new();
     // Version = 0
@@ -2046,6 +2076,91 @@ fn build_dops_box(audio: &Mp4AudioTrack) -> Vec<u8> {
     }
 
     build_box(b"dOps", &payload)
+}
+
+/// Build a FLAC sample entry box (`fLaC`) with its `dfLa` config.
+///
+/// Follows xiph "Encapsulation of FLAC in ISO Base Media File Format":
+/// one MP4 sample is exactly one FLAC frame, and `dfLa` (FullBox
+/// version 0) carries the native STREAMINFO metadata block. Sample
+/// rates above 16.16-fixed range (> 65535 Hz) are written as 0 in the
+/// entry; players must read the true rate from `dfLa` STREAMINFO.
+fn build_flac_box(audio: &Mp4AudioTrack) -> Vec<u8> {
+    // INV-604: FLAC sample entries require a valid 34-byte STREAMINFO.
+    // `MuxerBuilder` validates this up front; direct `Mp4Writer` users
+    // get a loud panic here rather than a silently corrupt file.
+    let streaminfo = audio.flac_streaminfo.as_deref().unwrap_or(&[]);
+    assert_invariant!(
+        parse_streaminfo(streaminfo).is_some(),
+        "INV-604: FLAC sample entry requires valid STREAMINFO",
+        "build_flac_box"
+    );
+    let info = parse_streaminfo(streaminfo).expect("builder-validated STREAMINFO");
+
+    let mut payload = Vec::new();
+    // Reserved (6 bytes)
+    payload.extend_from_slice(&[0u8; 6]);
+    // Data reference index
+    payload.extend_from_slice(&1u16.to_be_bytes());
+    // Reserved (u32 + u32)
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    payload.extend_from_slice(&0u32.to_be_bytes());
+    // Channel count (from STREAMINFO, authoritative)
+    payload.extend_from_slice(&u16::from(info.channels).to_be_bytes());
+    // Sample size in bits (from STREAMINFO)
+    payload.extend_from_slice(&u16::from(info.bits_per_sample).to_be_bytes());
+    // Pre-defined
+    payload.extend_from_slice(&0u16.to_be_bytes());
+    // Reserved
+    payload.extend_from_slice(&0u16.to_be_bytes());
+    // Sample rate (16.16 fixed point; 0 when > 65535 Hz, see dfLa)
+    let rate_fixed = if info.sample_rate > u32::from(u16::MAX) {
+        0u32
+    } else {
+        info.sample_rate << 16
+    };
+    payload.extend_from_slice(&rate_fixed.to_be_bytes());
+
+    // dfLa box with the native STREAMINFO block.
+    payload.extend_from_slice(&build_dfla_box(&info));
+
+    build_box(b"fLaC", &payload)
+}
+
+/// Build the `dfLa` (FLACSpecificBox) FullBox v0 carrying STREAMINFO.
+fn build_dfla_box(info: &crate::codec::flac::FlacStreaminfo) -> Vec<u8> {
+    let mut payload = Vec::new();
+    // FullBox: version = 0, flags = 0.
+    payload.extend_from_slice(&[0, 0, 0, 0]);
+    // One FLACMetadataBlock: last=1, type=0 (STREAMINFO), length=34.
+    payload.push(0x80);
+    payload.extend_from_slice(&(STREAMINFO_LEN as u32).to_be_bytes()[1..4]);
+    let mut raw = [0u8; STREAMINFO_LEN];
+    raw[0..2].copy_from_slice(&info.min_block_size.to_be_bytes());
+    raw[2..4].copy_from_slice(&info.max_block_size.to_be_bytes());
+    raw[4..7].copy_from_slice(&[
+        (info.min_frame_size >> 16) as u8,
+        (info.min_frame_size >> 8) as u8,
+        info.min_frame_size as u8,
+    ]);
+    raw[7..10].copy_from_slice(&[
+        (info.max_frame_size >> 16) as u8,
+        (info.max_frame_size >> 8) as u8,
+        info.max_frame_size as u8,
+    ]);
+    raw[10] = ((info.sample_rate >> 12) & 0xFF) as u8;
+    raw[11] = ((info.sample_rate >> 4) & 0xFF) as u8;
+    raw[12] = ((((info.sample_rate & 0x0F) << 4)
+        | (u32::from(info.channels - 1) << 1)
+        | (u32::from(info.bits_per_sample - 1) >> 4))
+        & 0xFF) as u8;
+    raw[13] = ((((u32::from(info.bits_per_sample - 1) & 0x0F) << 4)
+        | ((info.total_samples >> 32) as u32 & 0x0F))
+        & 0xFF) as u8;
+    raw[14..18].copy_from_slice(&(info.total_samples as u32).to_be_bytes());
+    raw[18..34].copy_from_slice(&info.md5);
+    payload.extend_from_slice(&raw);
+    build_box(b"dfLa", &payload)
 }
 
 fn build_trak_box(
@@ -3050,6 +3165,8 @@ mod tests {
             sample_rate: 48000,
             channels: 2,
             codec: AudioCodec::Aac(AacProfile::Lc),
+            flac_streaminfo: None,
+            opus_preskip: None,
         });
         assert!(matches!(
             writer.write_audio_sample(0, &[0x00, 0x01, 0x02]),
@@ -3062,6 +3179,8 @@ mod tests {
             sample_rate: 48000,
             channels: 2,
             codec: AudioCodec::Opus,
+            flac_streaminfo: None,
+            opus_preskip: None,
         });
         assert!(matches!(
             writer.write_audio_sample(0, &[]),
@@ -3125,6 +3244,8 @@ mod tests {
                 sample_rate: 48000,
                 channels: 2,
                 codec: AudioCodec::Aac(profile),
+                flac_streaminfo: None,
+                opus_preskip: None,
             });
 
             // Create a minimal valid ADTS frame for testing

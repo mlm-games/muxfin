@@ -19,7 +19,7 @@
 
 <table>
 <tr>
-<td align="center"><strong>Your Encoder</strong><br><sub>H.264 / HEVC / AV1<br>AAC / Opus</sub></td>
+<td align="center"><strong>Your Encoder</strong><br><sub>H.264 / HEVC / AV1<br>AAC / Opus / FLAC</sub></td>
 <td align="center">➡️</td>
 <td align="center"><strong>Muxfin</strong><br><sub>Pure Rust<br>Minimal external deps</sub></td>
 <td align="center">➡️</td>
@@ -108,8 +108,9 @@ If input violates the contract, Muxfin **fails fast** with explicit errors—no 
 | | VP9 | Frame header parsing, resolution/bit-depth/color config extraction |
 | **Audio** | AAC | All profiles: LC, Main, SSR, LTP, HE, HEv2 |
 | | Opus | Raw packets, 48kHz |
-| **Container** | Fast-start | `moov` before `mdat` for web playback |
-| | Matroska (MKV) | H.264/H.265/AV1/VP9 + AAC/Opus + subtitles via `MkvMuxer` |
+| | FLAC | Native frames, `fLaC` + `dfLa` (MP4), `A_FLAC` (MKV) |
+| | Demux | Ogg Opus (`.ogg`/`.opus`) and native FLAC (`.flac`) inputs, sample-accurate PTS |
+| | Matroska (MKV) | H.264/H.265/AV1/VP9 + AAC/Opus/FLAC + subtitles via `MkvMuxer` |
 | | WebM | VP9/AV1 + Opus (whitelist enforced) |
 | | B-frames | Explicit PTS/DTS support |
 | | Fragmented MP4 | For DASH/HLS streaming |
@@ -160,7 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 <details>
-<summary><strong>📹 More Examples: HEVC, AV1, Opus, Fragmented MP4</strong></summary>
+<summary><strong>📹 More Examples: HEVC, AV1, Opus, FLAC, Ogg, Fragmented MP4</strong></summary>
 
 ### HEVC/H.265 (4K)
 
@@ -191,6 +192,43 @@ let mut muxer = MuxerBuilder::new(file)
     .audio(AudioCodec::Opus, 48000, 2)
     .build()?;
 muxer.write_audio(0.0, &opus_packet)?;
+```
+
+### FLAC Audio (from `.flac` or Ogg-free native frames)
+
+```rust
+use muxfin::demux::demux_flac;
+
+// Demux keeps STREAMINFO + sample-accurate frame timestamps.
+let flac = demux_flac(&std::fs::read("audio.flac")?)?;
+
+let mut muxer = MuxerBuilder::new(file)
+    .audio(
+        AudioCodec::Flac,
+        flac.streaminfo.sample_rate,
+        flac.streaminfo.channels.into(),
+    )
+    .with_flac_streaminfo(flac.streaminfo_raw.to_vec())
+    .build()?;
+for frame in &flac.frames {
+    muxer.write_audio(frame.pts, &frame.data)?;
+}
+```
+
+### Ogg Opus input (`.ogg`/`.opus`)
+
+```rust
+use muxfin::demux::demux_ogg_opus;
+
+let ogg = demux_ogg_opus(&std::fs::read("audio.ogg")?)?;
+
+let mut muxer = MuxerBuilder::new(file)
+    .audio(AudioCodec::Opus, 48_000, ogg.channels.into())
+    .with_opus_preskip(ogg.pre_skip)
+    .build()?;
+for packet in &ogg.packets {
+    muxer.write_audio(packet.pts, &packet.data)?;
+}
 ```
 
 ### Fragmented MP4 (DASH/HLS)
@@ -315,8 +353,9 @@ muxfin info
 ```
 
 **Supported Codecs:**
-- **Video:** H.264 (AVC), H.265 (HEVC), AV1
-- **Audio:** AAC (all profiles), Opus
+- **Video:** H.264 (AVC), H.265 (HEVC), AV1, VP9
+- **Audio:** AAC (all profiles), Opus, FLAC
+- **Audio inputs:** raw ADTS/Opus dumps, Ogg Opus (`.ogg`/`.opus`), native FLAC (`.flac`) — containers auto-demux with sample-accurate timestamps, no `--sample-rate`/`--channels` needed
 
 **Supported Containers:** MP4 (default), Matroska (`--format mkv`), WebM (`--format webm`)
 

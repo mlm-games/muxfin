@@ -131,6 +131,10 @@ pub enum MkvWriterError {
     InvalidAdtsDetailed(Box<super::mp4::AdtsValidationError>),
     /// Audio sample is not a valid Opus packet.
     InvalidOpusPacket,
+    /// Audio sample is not a valid FLAC frame.
+    InvalidFlacFrame,
+    /// FLAC track is missing its STREAMINFO configuration.
+    MissingFlacStreaminfo,
     /// Audio track is not enabled on this writer.
     AudioNotEnabled,
     /// Subtitle track is not enabled on this writer.
@@ -170,6 +174,10 @@ impl fmt::Display for MkvWriterError {
             }
             MkvWriterError::InvalidAdtsDetailed(err) => write!(f, "{}", err),
             MkvWriterError::InvalidOpusPacket => write!(f, "invalid Opus packet"),
+            MkvWriterError::InvalidFlacFrame => write!(f, "invalid FLAC frame"),
+            MkvWriterError::MissingFlacStreaminfo => {
+                write!(f, "FLAC track is missing its STREAMINFO configuration")
+            }
             MkvWriterError::AudioNotEnabled => write!(f, "audio track not enabled"),
             MkvWriterError::SubtitleNotEnabled => write!(f, "subtitle track not enabled"),
             MkvWriterError::DurationOverflow => write!(f, "sample duration overflow"),
@@ -423,6 +431,12 @@ impl<Writer: Write> MkvWriter<Writer> {
                 }
                 data.to_vec()
             }
+            AudioCodec::Flac => {
+                if !crate::codec::flac::is_valid_flac_frame(data) {
+                    return Err(MkvWriterError::InvalidFlacFrame);
+                }
+                data.to_vec()
+            }
             AudioCodec::None => {
                 return Err(MkvWriterError::AudioNotEnabled);
             }
@@ -550,7 +564,7 @@ impl<Writer: Write> MkvWriter<Writer> {
             {
                 return Err(MkvWriterError::UnsupportedForWebM {
                     codec: track.codec.to_string(),
-                    reason: "WebM only supports Opus audio; use Matroska (.mkv) for AAC"
+                    reason: "WebM only supports Opus audio; use Matroska (.mkv) for AAC or FLAC"
                         .to_string(),
                 });
             }
@@ -869,12 +883,12 @@ fn aac_audio_specific_config(adts_header: [u8; 4]) -> [u8; 2] {
 const DEFAULT_AAC_ASC: [u8; 2] = [0x12, 0x10];
 
 /// OpusHead `CodecPrivate` for `A_OPUS` (RFC 7845 §5.1, 19 bytes, family 0).
-fn opus_head(channels: u8) -> Vec<u8> {
+fn opus_head(channels: u8, pre_skip: u16) -> Vec<u8> {
     let mut head = Vec::with_capacity(19);
     head.extend_from_slice(b"OpusHead");
     head.push(1); // version
     head.push(channels);
-    head.extend_from_slice(&OPUS_PRE_SKIP.to_le_bytes());
+    head.extend_from_slice(&pre_skip.to_le_bytes());
     head.extend_from_slice(&48000u32.to_le_bytes());
     head.extend_from_slice(&0i16.to_le_bytes()); // output gain
     head.push(0); // channel mapping family
@@ -893,12 +907,26 @@ fn build_audio_track(
                 .unwrap_or(DEFAULT_AAC_ASC);
             ("A_AAC", Some(asc.to_vec()), 0, 0)
         }
-        AudioCodec::Opus => (
-            "A_OPUS",
-            Some(opus_head(track.channels.min(8) as u8)),
-            u64::from(OPUS_PRE_SKIP) * 1_000_000_000 / 48_000,
-            OPUS_SEEK_PRE_ROLL_NS,
-        ),
+        AudioCodec::Opus => {
+            let pre_skip = track.opus_preskip.unwrap_or(OPUS_PRE_SKIP);
+            (
+                "A_OPUS",
+                Some(opus_head(track.channels.min(8) as u8, pre_skip)),
+                u64::from(pre_skip) * 1_000_000_000 / 48_000,
+                OPUS_SEEK_PRE_ROLL_NS,
+            )
+        }
+        AudioCodec::Flac => {
+            // Matroska A_FLAC carries the 34-byte STREAMINFO as CodecPrivate.
+            let streaminfo = track
+                .flac_streaminfo
+                .as_deref()
+                .ok_or(MkvWriterError::MissingFlacStreaminfo)?;
+            if crate::codec::flac::parse_streaminfo(streaminfo).is_none() {
+                return Err(MkvWriterError::MissingFlacStreaminfo);
+            }
+            ("A_FLAC", Some(streaminfo.to_vec()), 0, 0)
+        }
         AudioCodec::None => {
             return Err(MkvWriterError::AudioNotEnabled);
         }
@@ -1160,7 +1188,7 @@ mod tests {
 
     #[test]
     fn opus_head_layout() {
-        let head = opus_head(2);
+        let head = opus_head(2, OPUS_PRE_SKIP);
         assert_eq!(head.len(), 19);
         assert_eq!(&head[..8], b"OpusHead");
         assert_eq!(head[8], 1); // version

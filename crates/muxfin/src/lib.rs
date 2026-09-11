@@ -59,6 +59,9 @@ pub mod fragmented;
 // Codec configuration extraction (minimal bitstream parsing)
 pub mod codec;
 
+// Container demuxing for remuxing already-encoded audio (Ogg Opus, FLAC)
+pub mod demux;
+
 // Input validation utilities for dry-run functionality
 pub mod validation;
 

@@ -9,6 +9,7 @@
 //! - **H.264/AVC**: Extract SPS/PPS from Annex B NAL units
 //! - **H.265/HEVC**: Extract VPS/SPS/PPS from Annex B NAL units
 //! - **VP9**: Extract frame headers and configuration from compressed frames
+//! - **FLAC**: Parse STREAMINFO and frame headers for sample-accurate remuxing
 //! - **Opus**: Parse TOC for frame duration, build dOps config
 //! - **AV1**: Parse OBU headers for sequence configuration
 //!
@@ -22,12 +23,17 @@
 
 pub mod av1;
 pub mod common;
+pub mod flac;
 pub mod h264;
 pub mod h265;
 pub mod opus;
 pub mod vp9;
 
 pub use common::{AnnexBNalIter, find_start_code};
+pub use flac::{
+    FlacFrameHeader, FlacMetadataBlock, FlacStreaminfo,
+    parse_frame_header as parse_flac_frame_header, parse_streaminfo,
+};
 pub use h264::{AvcConfig, annexb_to_avcc, extract_avc_config, is_h264_keyframe};
 pub use h265::{HevcConfig, extract_hevc_config, hevc_annexb_to_hvcc, is_hevc_keyframe};
 pub use opus::{OPUS_SAMPLE_RATE, OpusConfig, is_valid_opus_packet, opus_packet_samples};

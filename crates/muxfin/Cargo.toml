@@ -41,6 +41,7 @@ proptest.workspace = true
 tempfile.workspace = true
 criterion.workspace = true
 matroska-demuxer.workspace = true
+dissonia = "0.1.5"
 
 [[bench]]
 name = "muxing"

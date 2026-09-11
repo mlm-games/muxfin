@@ -131,9 +131,11 @@ impl OpusFrameDuration {
 
 /// Extract frame duration from the Opus TOC byte.
 ///
-/// The TOC byte encodes the frame configuration:
-/// - Bits 0-4: Frame count configuration
-/// - Bits 5-7: Bandwidth/mode/config
+/// The TOC byte layout (RFC 6716 Figure 1) is `config(5) | s(1) | c(2)`
+/// with `config = toc >> 3`. Durations follow RFC 6716 Table 2:
+/// - 0-11 (SILK-only NB/MB/WB): 10, 20, 40, 60 ms cycling `config % 4`
+/// - 12-15 (Hybrid SWB/FB): 10, 20 ms cycling `config % 2`
+/// - 16-31 (CELT-only NB/WB/SWB/FB): 2.5, 5, 10, 20 ms cycling `config % 4`
 ///
 /// Returns the frame duration for a single frame in the packet.
 pub fn opus_frame_duration_from_toc(toc: u8) -> Option<OpusFrameDuration> {
@@ -145,19 +147,27 @@ pub fn opus_frame_duration_from_toc(toc: u8) -> Option<OpusFrameDuration> {
     }
 
     // Frame size depends on config value
-    // See RFC 6716 Section 3.1
+    // See RFC 6716 Section 3.1, Table 2.
     match config {
-        // SILK-only modes
-        0..=3 => Some(OpusFrameDuration::Ms10),
-        4..=7 => Some(OpusFrameDuration::Ms20),
-        8..=11 => Some(OpusFrameDuration::Ms40),
-        12..=15 => Some(OpusFrameDuration::Ms60),
-        // Hybrid modes
-        16..=19 => Some(OpusFrameDuration::Ms10),
-        20..=23 => Some(OpusFrameDuration::Ms20),
-        // CELT-only modes
-        24..=27 => Some(OpusFrameDuration::Ms2_5),
-        28..=31 => Some(OpusFrameDuration::Ms5),
+        // SILK-only modes (NB/MB/WB): 10, 20, 40, 60 ms
+        0..=11 => match config % 4 {
+            0 => Some(OpusFrameDuration::Ms10),
+            1 => Some(OpusFrameDuration::Ms20),
+            2 => Some(OpusFrameDuration::Ms40),
+            _ => Some(OpusFrameDuration::Ms60),
+        },
+        // Hybrid modes (SWB/FB): 10, 20 ms
+        12..=15 => match config % 2 {
+            0 => Some(OpusFrameDuration::Ms10),
+            _ => Some(OpusFrameDuration::Ms20),
+        },
+        // CELT-only modes (NB/WB/SWB/FB): 2.5, 5, 10, 20 ms
+        16..=31 => match config % 4 {
+            0 => Some(OpusFrameDuration::Ms2_5),
+            1 => Some(OpusFrameDuration::Ms5),
+            2 => Some(OpusFrameDuration::Ms10),
+            _ => Some(OpusFrameDuration::Ms20),
+        },
         _ => None,
     }
 }
@@ -277,39 +287,71 @@ mod tests {
 
     #[test]
     fn test_opus_frame_duration_from_toc_silk() {
-        // SILK 10ms (config 0-3)
+        // SILK-only NB (config 0-3): 10, 20, 40, 60 ms
         assert_eq!(
-            opus_frame_duration_from_toc(0b0000_0000),
+            opus_frame_duration_from_toc(0b0000_0000), // config 0
             Some(OpusFrameDuration::Ms10)
         );
-        // SILK 20ms (config 4-7)
         assert_eq!(
-            opus_frame_duration_from_toc(0b0010_0000),
-            Some(OpusFrameDuration::Ms20)
+            opus_frame_duration_from_toc(0b0001_1000), // config 3
+            Some(OpusFrameDuration::Ms60)
         );
-        // SILK 40ms (config 8-11)
+        // SILK-only MB (config 4-7): 10, 20, 40, 60 ms
         assert_eq!(
-            opus_frame_duration_from_toc(0b0100_0000),
-            Some(OpusFrameDuration::Ms40)
+            opus_frame_duration_from_toc(0b0010_0000), // config 4
+            Some(OpusFrameDuration::Ms10)
         );
-        // SILK 60ms (config 12-15)
         assert_eq!(
-            opus_frame_duration_from_toc(0b0110_0000),
+            opus_frame_duration_from_toc(0b0011_1000), // config 7
+            Some(OpusFrameDuration::Ms60)
+        );
+        // SILK-only WB (config 8-11): 10, 20, 40, 60 ms
+        assert_eq!(
+            opus_frame_duration_from_toc(0b0100_0000), // config 8
+            Some(OpusFrameDuration::Ms10)
+        );
+        assert_eq!(
+            opus_frame_duration_from_toc(0b0101_1000), // config 11
             Some(OpusFrameDuration::Ms60)
         );
     }
 
     #[test]
     fn test_opus_frame_duration_from_toc_celt() {
-        // CELT 2.5ms (config 24-27)
+        // CELT-only NB (config 16-19): 2.5, 5, 10, 20 ms
         assert_eq!(
-            opus_frame_duration_from_toc(0b1100_0000),
+            opus_frame_duration_from_toc(0b1000_0000), // config 16
             Some(OpusFrameDuration::Ms2_5)
         );
-        // CELT 5ms (config 28-31)
         assert_eq!(
-            opus_frame_duration_from_toc(0b1110_0000),
+            opus_frame_duration_from_toc(0b1000_1000), // config 17
             Some(OpusFrameDuration::Ms5)
+        );
+        assert_eq!(
+            opus_frame_duration_from_toc(0b1001_0000), // config 18
+            Some(OpusFrameDuration::Ms10)
+        );
+        // CELT-only FB (config 28-31): 2.5, 5, 10, 20 ms
+        assert_eq!(
+            opus_frame_duration_from_toc(0b1110_0000), // config 28
+            Some(OpusFrameDuration::Ms2_5)
+        );
+        assert_eq!(
+            opus_frame_duration_from_toc(0b1111_1000), // config 31
+            Some(OpusFrameDuration::Ms20)
+        );
+    }
+
+    #[test]
+    fn test_opus_frame_duration_from_toc_hybrid() {
+        // Hybrid SWB/FB (config 12-15): 10, 20 ms
+        assert_eq!(
+            opus_frame_duration_from_toc(0b0110_0000), // config 12
+            Some(OpusFrameDuration::Ms10)
+        );
+        assert_eq!(
+            opus_frame_duration_from_toc(0b0111_1000), // config 15
+            Some(OpusFrameDuration::Ms20)
         );
     }
 
@@ -346,17 +388,17 @@ mod tests {
 
     #[test]
     fn test_opus_packet_samples() {
-        // SILK 20ms frame (config=4), 1 frame (code=0)
+        // SILK MB 10ms frame (config=4), 1 frame (code=0)
         // TOC: config=4 (bits 3-7 = 0b00100), s=0, c=0
         // Binary: 0b00100_0_00 = 0x20 = 32
         let packet = vec![0x20, 0x01, 0x02, 0x03];
-        assert_eq!(opus_packet_samples(&packet), Some(960));
+        assert_eq!(opus_packet_samples(&packet), Some(480));
 
-        // SILK 20ms frame (config=4), 2 frames (code=1)
+        // SILK MB 10ms frame (config=4), 2 frames (code=1)
         // TOC: config=4 (bits 3-7 = 0b00100), s=0, c=1
         // Binary: 0b00100_0_01 = 0x21 = 33
         let packet2 = vec![0x21, 0x01, 0x02, 0x03];
-        assert_eq!(opus_packet_samples(&packet2), Some(1920));
+        assert_eq!(opus_packet_samples(&packet2), Some(960));
     }
 
     #[test]
@@ -366,10 +408,10 @@ mod tests {
         assert_eq!(opus_packet_samples(&[]), None);
 
         // Valid TOC config should work
-        let valid_toc = vec![0xFF]; // config=31, valid
+        let valid_toc = vec![0xFF]; // config=31 (CELT-only FB 20ms), valid
         assert_eq!(
             opus_frame_duration_from_toc(valid_toc[0]),
-            Some(OpusFrameDuration::Ms5)
+            Some(OpusFrameDuration::Ms20)
         );
         // But packet is too short for frame count
         assert_eq!(opus_packet_samples(&valid_toc), None);
@@ -382,7 +424,7 @@ mod tests {
 
     #[test]
     fn test_is_valid_opus_packet() {
-        // Valid: config=4 (SILK 20ms), code=0 (1 frame)
+        // Valid: config=4 (SILK MB 10ms), code=0 (1 frame)
         assert!(is_valid_opus_packet(&[0x20, 0x01, 0x02]));
         assert!(!is_valid_opus_packet(&[]));
     }
