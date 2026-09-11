@@ -1,13 +1,9 @@
-/target/
+target/
+dist/
 **/*.rs.bk
 *.pdb
-*.exe
-*.dll
-*.so
-*.dylib
 *.log
 .DS_Store
-Thumbs.db
 .vscode/
 
 # Local-only internal notes (never commit)

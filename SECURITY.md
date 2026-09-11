@@ -9,13 +9,15 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in Muxide, please report it responsibly.
+If you discover a security vulnerability in Muxfin, please report it responsibly.
 
 ### How to Report
 
 **DO NOT** open a public GitHub issue for security vulnerabilities.
 
-Instead, please email: **michaelallenkuykendall@gmail.com**
+Instead, please open a private security advisory on the
+[mlm-games/muxfin](https://github.com/mlm-games/muxfin/security/advisories/new)
+repo, or contact the maintainers via the issue tracker for guidance.
 
 Include:
 - Description of the vulnerability
@@ -45,7 +47,7 @@ Security issues we care about:
 
 ## Security Design
 
-Muxide is designed with security in mind:
+Muxfin is designed with security in mind:
 
 1. **Pure Rust** - Memory safety enforced by Rust’s guarantees
 2. **Minimal runtime dependencies** - Limited third-party runtime dependency supply chain
@@ -55,4 +57,4 @@ Muxide is designed with security in mind:
 
 ## Acknowledgments
 
-We thank security researchers who help keep Muxide safe. Contributors will be acknowledged here (with permission).
+We thank security researchers who help keep Muxfin safe. Contributors will be acknowledged here (with permission).

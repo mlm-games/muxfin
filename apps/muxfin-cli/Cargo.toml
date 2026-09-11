@@ -1,0 +1,25 @@
+[package]
+name = "muxfin-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI tool for muxfin: mux encoded frames into MP4, validate inputs, inspect files."
+publish = false
+
+[[bin]]
+name = "muxfin"
+path = "src/main.rs"
+
+[dependencies]
+muxfin.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+indicatif.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

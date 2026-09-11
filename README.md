@@ -1,27 +1,27 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Michael-A-Kuykendall/muxide/main/assets/muxide-logo.png" alt="Muxide" width="350"><br>
+  <img src="https://raw.githubusercontent.com/mlm-games/muxfin/main/assets/muxfin-logo.png" alt="Muxfin" width="350"><br>
   <strong>The last mile from encoder to playable MP4.</strong><br><br>
-  <a href="https://crates.io/crates/muxide"><img src="https://img.shields.io/crates/v/muxide.svg" alt="Crates.io"></a>
-  <a href="https://crates.io/crates/muxide"><img src="https://img.shields.io/crates/d/muxide.svg" alt="Downloads"></a>
-  <a href="https://docs.rs/muxide"><img src="https://docs.rs/muxide/badge.svg" alt="Documentation"></a>
-    <a href="#license"><img src="https://img.shields.io/crates/l/muxide.svg" alt="License"></a>
-    <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.92-blue.svg" alt="MSRV"></a>
-  <a href="https://github.com/Michael-A-Kuykendall/muxide/actions"><img src="https://github.com/Michael-A-Kuykendall/muxide/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://crates.io/crates/muxfin"><img src="https://img.shields.io/crates/v/muxfin.svg" alt="Crates.io"></a>
+  <a href="https://github.com/mlm-games/muxfin/blob/main/LICENSE"><img src="https://img.shields.io/github/license/mlm-games/muxfin" alt="License"></a>
+  <a href="https://docs.rs/muxfin"><img src="https://docs.rs/muxfin/badge.svg" alt="Documentation"></a>
+    <a href="#license"><img src="https://img.shields.io/crates/l/muxfin.svg" alt="License"></a>
+    <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/MSRV-1.98-blue.svg" alt="MSRV"></a>
+  <a href="https://github.com/mlm-games/muxfin/actions"><img src="https://github.com/mlm-games/muxfin/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
 
 <p align="center">
-  <code>cargo add muxide</code>
+  <code>cargo add muxfin</code>
 </p>
 
 ---
 
-> **Muxide** takes correctly-timestamped, already-encoded audio/video frames and produces a standards-compliant MP4 — **pure Rust, minimal external dependencies, no FFmpeg.**
+> **Muxfin** takes correctly-timestamped, already-encoded audio/video frames and produces a standards-compliant MP4 — **pure Rust, minimal external dependencies, no FFmpeg.**
 
 <table>
 <tr>
 <td align="center"><strong>Your Encoder</strong><br><sub>H.264 / HEVC / AV1<br>AAC / Opus</sub></td>
 <td align="center">➡️</td>
-<td align="center"><strong>Muxide</strong><br><sub>Pure Rust<br>Minimal external deps</sub></td>
+<td align="center"><strong>Muxfin</strong><br><sub>Pure Rust<br>Minimal external deps</sub></td>
 <td align="center">➡️</td>
 <td align="center"><strong>playable.mp4</strong><br><sub>Standards-compliant<br>Fast-start ready</sub></td>
 </tr>
@@ -29,7 +29,7 @@
 
 ---
 
-## Why Muxide Exists
+## Why Muxfin Exists
 
 If you're building a recording pipeline in Rust, you know the tradeoffs:
 
@@ -40,7 +40,7 @@ If you're building a recording pipeline in Rust, you know the tradeoffs:
 | **Raw MP4 writing** | ISO-BMFF expertise required (sample tables, interleaving, moov layout) |
 | **"Minimal" crates** | Often missing fast-start, strict validation, or production ergonomics |
 
-Muxide solves **one job cleanly**:
+Muxfin solves **one job cleanly**:
 
 > Take already-encoded frames with correct timestamps → produce a **standards-compliant, immediately-playable MP4** → using **pure Rust**.
 
@@ -50,11 +50,11 @@ Nothing more. Nothing less.
 
 ### As a Library
 ```bash
-cargo add muxide
+cargo add muxfin
 ```
 
 ```rust
-use muxide::api::{MuxerBuilder, VideoCodec};
+use muxfin::api::{MuxerBuilder, VideoCodec};
 
 let mut muxer = MuxerBuilder::new(file)
     .video(VideoCodec::H264, 1920, 1080, 30.0)?
@@ -68,33 +68,33 @@ muxer.finish()?;
 ### As a CLI Tool
 ```bash
 # Install globally
-cargo install muxide
+cargo install muxfin
 
 # Or download pre-built binary from releases
 # Then use:
-muxide --help
+muxfin --help
 
 # Quick examples:
-muxide mux --video frames/ --output output.mp4 --width 1920 --height 1080 --fps 30
-muxide mux --video video.h264 --audio audio.aac --output output.mp4
-muxide validate --video frames/ --audio audio.aac
-muxide info input.mp4
+muxfin mux --video frames/ --output output.mp4 --width 1920 --height 1080 --fps 30
+muxfin mux --video video.h264 --audio audio.aac --output output.mp4
+muxfin validate --video frames/ --audio audio.aac
+muxfin info input.mp4
 ```
 
 The CLI tool accepts raw encoded frames from stdin or files and produces MP4 output.
 
 ## Core Invariant
 
-Muxide enforces a strict contract:
+Muxfin enforces a strict contract:
 
-| Your Responsibility | Muxide's Guarantee |
+| Your Responsibility | Muxfin's Guarantee |
 |:-------------------:|:------------------:|
 | ✓ Frames are already encoded | ✓ Valid ISO-BMFF (MP4) |
 | ✓ Timestamps are monotonic | ✓ Correct sample tables |
 | ✓ DTS provided for B-frames | ✓ Fast-start layout |
 | ✓ Codec headers in keyframes | ✓ No post-processing needed |
 
-If input violates the contract, Muxide **fails fast** with explicit errors—no silent corruption, no guessing.
+If input violates the contract, Muxfin **fails fast** with explicit errors—no silent corruption, no guessing.
 
 ---
 
@@ -124,17 +124,17 @@ If input violates the contract, Muxide **fails fast** with explicit errors—no 
 | 📦 **Minimal deps** | Only essential Rust crates — no external binaries |
 | 🧵 **Thread-safe** | `Send + Sync` when writer is |
 | ✅ **Well-tested** | Unit, integration, property tests |
-| 📜 **Permissive license** | Dual-licensed: MIT OR Apache-2.0 |
+| 📜 **Permissive license** | MPL-2.0 |
 | 🚨 **Developer-friendly** | Exceptional error messages make debugging 10x faster |
 
-> **Note:** `no_std` is not supported. Muxide requires `std::io::Write`.
+> **Note:** `no_std` is not supported. Muxfin requires `std::io::Write`.
 
 ---
 
 ## Quick Start
 
 ```rust
-use muxide::api::{MuxerBuilder, VideoCodec, AudioCodec, Metadata};
+use muxfin::api::{MuxerBuilder, VideoCodec, AudioCodec, Metadata};
 use std::fs::File;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -194,7 +194,7 @@ muxer.write_audio(0.0, &opus_packet)?;
 ### Fragmented MP4 (DASH/HLS)
 
 ```rust
-use muxide::codec::vp9::Vp9Config;
+use muxfin::codec::vp9::Vp9Config;
 
 // H.264
 let sps_bytes = vec![0x67, 0x42, 0x00, 0x1e, 0xda, 0x02, 0x80, 0x2d, 0x8b, 0x11];
@@ -277,20 +277,20 @@ muxer.write_video_with_dts(
 
 ## Command Line Tool
 
-Muxide includes a command-line tool for quick testing and development workflows:
+Muxfin includes a command-line tool for quick testing and development workflows:
 
 ```bash
 # Install the CLI tool
-cargo install muxide
+cargo install muxfin
 
 # Basic video-only muxing
-muxide mux \
+muxfin mux \
   --video keyframes.h264 \
   --width 1920 --height 1080 --fps 30 \
   --output recording.mp4
 
 # Video + audio with metadata
-muxide mux \
+muxfin mux \
   --video stream.h264 \
   --audio stream.aac \
   --video-codec h264 \
@@ -302,13 +302,13 @@ muxide mux \
   --output final.mp4
 
 # JSON output for automation
-muxide mux --json [args...] > stats.json
+muxfin mux --json [args...] > stats.json
 
 # Validate input files without muxing
-muxide validate --video input.h264 --audio input.aac
+muxfin validate --video input.h264 --audio input.aac
 
 # Get info about supported codecs
-muxide info
+muxfin info
 ```
 
 **Supported Codecs:**
@@ -324,9 +324,9 @@ muxide info
 
 ---
 
-## What Muxide Is Not
+## What Muxfin Is Not
 
-Muxide is intentionally **focused**. It does **not**:
+Muxfin is intentionally **focused**. It does **not**:
 
 | Not Supported | Why |
 |---------------|-----|
@@ -337,13 +337,13 @@ Muxide is intentionally **focused**. It does **not**:
 | Non-MP4 containers | MKV, WebM, AVI not supported |
 | DRM/encryption | Out of scope |
 
-**Muxide is the last mile**: encoder output → playable file.
+**Muxfin is the last mile**: encoder output → playable file.
 
 ---
 
 ## Use Cases
 
-Muxide is a great fit for:
+Muxfin is a great fit for:
 
 - 🎥 **Screen recorders** — capture → encode → mux → ship
 - 📹 **Camera apps** — webcam/IP camera recording pipelines (e.g., CrabCamera integration)
@@ -386,7 +386,7 @@ This example is intentionally minimal:
 
 ## Performance
 
-Muxide is designed for **minimal overhead**. Muxing should never be your bottleneck.
+Muxfin is designed for **minimal overhead**. Muxing should never be your bottleneck.
 
 | Scenario | Time | Throughput |
 |----------|------|------------|
@@ -433,7 +433,7 @@ Muxide is designed for **minimal overhead**. Muxing should never be your bottlen
 
 | Resource | Description |
 |----------|-------------|
-| [📚 API Reference](https://docs.rs/muxide) | Complete API documentation |
+| [📚 API Reference](https://docs.rs/muxfin) | Complete API documentation |
 | [📜 Design Charter](docs/charter.md) | Architecture decisions and rationale |
 | [📋 API Contract](docs/contract.md) | Input/output guarantees |
 
@@ -450,14 +450,14 @@ FFmpeg is excellent, but:
 - Process orchestration overhead
 - "What flags was this built with?" debugging
 
-Muxide is a single `cargo add` with minimal external dependencies.
+Muxfin is a single `cargo add` with minimal external dependencies.
 
 </details>
 
 <details>
-<summary><strong>Can Muxide encode video?</strong></summary>
+<summary><strong>Can Muxfin encode video?</strong></summary>
 
-No. Muxide is **muxing only**. For encoding, use:
+No. Muxfin is **muxing only**. For encoding, use:
 - `openh264` — H.264 encoding (BSD)
 - `rav1e` — AV1 encoding (BSD)
 - `x264`/`x265` — H.264/HEVC (GPL, via FFI)
@@ -467,14 +467,14 @@ No. Muxide is **muxing only**. For encoding, use:
 <details>
 <summary><strong>What if my timestamps are wrong?</strong></summary>
 
-Muxide will reject non-monotonic timestamps with a clear error. It does not attempt to "fix" broken input — this is by design to ensure predictable output.
+Muxfin will reject non-monotonic timestamps with a clear error. It does not attempt to "fix" broken input — this is by design to ensure predictable output.
 
 </details>
 
 <details>
-<summary><strong>Is Muxide production-ready?</strong></summary>
+<summary><strong>Is Muxfin production-ready?</strong></summary>
 
-Yes. Muxide has an extensive test suite (unit, integration, property-based tests) and is designed for predictable, deterministic behavior.
+Yes. Muxfin has an extensive test suite (unit, integration, property-based tests) and is designed for predictable, deterministic behavior.
 
 </details>
 
@@ -482,14 +482,12 @@ Yes. Muxide has an extensive test suite (unit, integration, property-based tests
 
 ## License
 
-Licensed under either of:
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+MPL-2.0.
 
-at your option.
+See [LICENSE](LICENSE) for more info.
 
 ---
 
 <p align="center">
-  <em>Muxide is designed to be <strong>boring</strong> in the best way:<br>predictable, strict, fast, and invisible once integrated.</em>
+  <em>Muxfin is designed to be <strong>boring</strong> in the best way:<br>predictable, strict, fast, and invisible once integrated.</em>
 </p>

@@ -168,6 +168,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3be2ad0423bdbbb0e25bc89add796f3559706d4a95e1bc98e4d9662a957b6a19"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.5.49"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -176,7 +185,7 @@ dependencies = [
  "heck",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.111",
 ]
 
 [[package]]
@@ -437,7 +446,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
-name = "muxide"
+name = "muxfin"
 version = "0.2.1"
 dependencies = [
  "anyhow",
@@ -450,6 +459,20 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "muxfin-cli"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "clap_complete",
+ "indicatif",
+ "muxfin",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -740,7 +763,7 @@ checksum = "d540f220d3187173da220f885ab66608367b6574e925011a9353e4badda91d79"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.111",
 ]
 
 [[package]]
@@ -774,6 +797,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12df2e0110f65b775f769bb17ef989067a1d931b2eb822bd4346631eeada89f9"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -788,22 +822,22 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
 dependencies = [
  "thiserror-impl",
 ]
 
 [[package]]
 name = "thiserror-impl"
-version = "1.0.69"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -906,7 +940,7 @@ dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.111",
  "wasm-bindgen-shared",
 ]
 
@@ -1059,5 +1093,5 @@ checksum = "d8a8d209fdf45cf5138cbb5a506f6b52522a25afccc534d1475dad8e31105c6a"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn",
+ "syn 2.0.111",
 ]

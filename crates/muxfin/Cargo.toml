@@ -1,0 +1,44 @@
+[package]
+name = "muxfin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minimal-dependency pure-Rust MP4 muxer for recording applications."
+keywords = ["mp4", "video", "muxer", "h264", "multimedia"]
+categories = [
+  "multimedia",
+  "multimedia::encoding",
+  "multimedia::video",
+  "command-line-utilities",
+]
+exclude = [
+  ".github/",
+  ".vscode/",
+  "release-notes/",
+  "target/",
+  "**/*.mp4",
+  "**/*.gif",
+  "**/*.rgb",
+  "**/*.h264",
+  "**/*.bak",
+]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+indicatif.workspace = true
+
+[dev-dependencies]
+lazy_static.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "muxing"
+harness = false

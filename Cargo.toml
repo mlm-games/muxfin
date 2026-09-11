@@ -1,54 +1,28 @@
-[package]
-name = "muxide"
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
 version = "0.2.1"
 edition = "2024"
-rust-version = "1.92"
-description = "Minimal-dependency pure-Rust MP4 muxer for recording applications. Includes CLI tool and library API."
-authors = ["Michael A. Kuykendall <michaelallenkuykendall@gmail.com>"]
-readme = "README.md"
-repository = "https://github.com/Michael-A-Kuykendall/muxide"
-homepage = "https://github.com/Michael-A-Kuykendall/muxide"
-documentation = "https://docs.rs/muxide"
-license = "MIT"
-keywords = ["mp4", "video", "muxer", "h264", "multimedia"]
-categories = [
-	"multimedia",
-	"multimedia::encoding",
-	"multimedia::video",
-	"command-line-utilities",
-]
-exclude = [
-	".github/",
-	".vscode/",
-	"release-notes/",
-	"target/",
-	"**/*.mp4",
-	"**/*.gif",
-	"**/*.rgb",
-	"**/*.h264",
-	"**/*.bak",
-]
+rust-version = "1.98"
+license = "MPL-2.0"
+repository = "https://github.com/mlm-games/muxfin"
 
-[[bin]]
-name = "muxide"
-path = "src/bin/muxide.rs"
-
-[dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-clap = { version = "4.4", features = ["derive", "color", "suggestions"] }
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4.5", features = ["derive", "color", "suggestions"] }
+clap_complete = "4.5"
 indicatif = "0.17"
-anyhow = "1.0"
-thiserror = "1.0"
-
-[dev-dependencies]
+anyhow = "1"
+thiserror = "2"
 lazy_static = "1.4"
-proptest = "=1.5.0"
-tempfile = "3.0"
+proptest = "1"
+tempfile = "3"
 criterion = "0.5"
 
-[[bench]]
-name = "muxing"
-harness = false
+muxfin = { path = "crates/muxfin", version = "0.2.1" }
 
-[workspace]
+[profile.release]
+lto = "thin"
