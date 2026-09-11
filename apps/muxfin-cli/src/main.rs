@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -15,7 +15,7 @@ use muxfin::demux::{FlacStream, OggOpusTrack, demux_flac, demux_ogg_opus};
 
 fn read_hex_bytes(contents: &str) -> Vec<u8> {
     let hex: String = contents.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(hex.len() % 2 == 0, "hex must have even length");
+    assert!(hex.len().is_multiple_of(2), "hex must have even length");
 
     let mut out = Vec::with_capacity(hex.len() / 2);
     for i in (0..hex.len()).step_by(2) {
@@ -349,10 +349,10 @@ fn mux_manifest_command(
             if s.pts < 0 || s.dts < 0 {
                 anyhow::bail!("video sample {} has negative timestamp", s.path.display());
             }
-            if let Some(prev) = prev_dts {
-                if s.dts <= prev {
-                    anyhow::bail!("video DTS must strictly increase");
-                }
+            if let Some(prev) = prev_dts
+                && s.dts <= prev
+            {
+                anyhow::bail!("video DTS must strictly increase");
             }
             prev_dts = Some(s.dts);
             let blob = std::fs::read(&s.path)
@@ -382,10 +382,10 @@ fn mux_manifest_command(
             if s.pts < 0 {
                 anyhow::bail!("audio sample {} has negative timestamp", s.path.display());
             }
-            if let Some(prev) = prev_dts {
-                if s.dts < prev {
-                    anyhow::bail!("audio DTS must not decrease");
-                }
+            if let Some(prev) = prev_dts
+                && s.dts < prev
+            {
+                anyhow::bail!("audio DTS must not decrease");
             }
             prev_dts = Some(s.dts);
             let blob = std::fs::read(&s.path)
@@ -1303,7 +1303,7 @@ fn validate_hex_file(path: &PathBuf, file_type: &str) -> Result<String> {
     if hex_chars.is_empty() {
         anyhow::bail!("{} file is empty", file_type);
     }
-    if hex_chars.len() % 2 != 0 {
+    if !hex_chars.len().is_multiple_of(2) {
         anyhow::bail!("{} file contains odd number of hex characters", file_type);
     }
     for ch in hex_chars.chars() {
@@ -1449,7 +1449,7 @@ fn info_command(input: PathBuf, verbose: bool, json: bool) -> Result<()> {
 
 /// Inspect an Ogg Opus or native FLAC file using the built-in demuxers.
 fn info_audio_container_command(
-    input: &PathBuf,
+    input: &Path,
     buffer: &[u8],
     verbose: bool,
     json: bool,
@@ -1525,7 +1525,7 @@ fn info_audio_container_command(
 }
 
 /// Inspect a Matroska/WebM file using the external `mkv-element` crate.
-fn info_matroska_command(input: &PathBuf, buffer: &[u8], verbose: bool, json: bool) -> Result<()> {
+fn info_matroska_command(input: &Path, buffer: &[u8], verbose: bool, json: bool) -> Result<()> {
     use mkv_element::io::blocking_impl::ReadFrom;
     use mkv_element::prelude::{Ebml, Segment};
 

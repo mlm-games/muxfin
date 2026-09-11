@@ -16,7 +16,10 @@ fn read_hex_fixture(dir: &str, name: &str) -> Vec<u8> {
         .join(name);
     let contents = fs::read_to_string(path).expect("fixture must be readable");
     let hex: String = contents.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(hex.len() % 2 == 0, "hex fixtures must have even length");
+    assert!(
+        hex.len().is_multiple_of(2),
+        "hex fixtures must have even length"
+    );
 
     let mut out = Vec::with_capacity(hex.len() / 2);
     for i in (0..hex.len()).step_by(2) {
@@ -47,7 +50,7 @@ fn video_pts_negative_is_rejected() {
     let err = muxer.write_video(-0.001, &frame, true).unwrap_err();
 
     assert!(
-        matches!(err, MuxerError::NegativeVideoPts { pts, frame_index } 
+        matches!(err, MuxerError::NegativeVideoPts { pts, frame_index }
         if pts < 0.0 && frame_index == 0)
     );
 

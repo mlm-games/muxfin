@@ -127,9 +127,7 @@ pub fn split_h264_access_units(data: &[u8]) -> Vec<AccessUnit<'_>> {
         }
         prev_type = Some(t);
     }
-    build_units(data, &nals, &boundaries, |types| {
-        types.iter().any(|&t| t == 5)
-    })
+    build_units(data, &nals, &boundaries, |types| types.contains(&5))
 }
 
 /// Split an H.265/HEVC Annex B stream into access units.

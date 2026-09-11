@@ -1732,14 +1732,14 @@ impl<Writer: Write> Muxer<Writer> {
         }
 
         // Validate PTS is strictly increasing
-        if let Some(prev) = self.last_video_pts {
-            if pts <= prev {
-                return Err(MuxerError::NonIncreasingVideoPts {
-                    prev_pts: prev,
-                    curr_pts: pts,
-                    frame_index,
-                });
-            }
+        if let Some(prev) = self.last_video_pts
+            && pts <= prev
+        {
+            return Err(MuxerError::NonIncreasingVideoPts {
+                prev_pts: prev,
+                curr_pts: pts,
+                frame_index,
+            });
         }
 
         let scaled_pts = (pts * MEDIA_TIMESCALE as f64).round();
@@ -1813,14 +1813,14 @@ impl<Writer: Write> Muxer<Writer> {
         // This is valid and expected for B-frame streams.
 
         // Validate DTS is strictly increasing
-        if let Some(prev_dts) = self.last_video_dts {
-            if dts <= prev_dts {
-                return Err(MuxerError::NonIncreasingDts {
-                    prev_dts,
-                    curr_dts: dts,
-                    frame_index,
-                });
-            }
+        if let Some(prev_dts) = self.last_video_dts
+            && dts <= prev_dts
+        {
+            return Err(MuxerError::NonIncreasingDts {
+                prev_dts,
+                curr_dts: dts,
+                frame_index,
+            });
         }
 
         let scaled_pts = (pts * MEDIA_TIMESCALE as f64).round();
@@ -2102,14 +2102,14 @@ impl<Writer: Write> Muxer<Writer> {
         }
 
         // Validate PTS is non-decreasing
-        if let Some(prev) = self.last_audio_pts {
-            if pts < prev {
-                return Err(MuxerError::DecreasingAudioPts {
-                    prev_pts: prev,
-                    curr_pts: pts,
-                    frame_index,
-                });
-            }
+        if let Some(prev) = self.last_audio_pts
+            && pts < prev
+        {
+            return Err(MuxerError::DecreasingAudioPts {
+                prev_pts: prev,
+                curr_pts: pts,
+                frame_index,
+            });
         }
 
         // Verdict §7: audio may begin before video; edit lists preserve A/V
@@ -2164,14 +2164,14 @@ impl<Writer: Write> Muxer<Writer> {
             return Err(MuxerError::EmptySubtitleSample { frame_index });
         }
 
-        if let Some(prev) = self.last_subtitle_pts {
-            if pts < prev {
-                return Err(MuxerError::DecreasingSubtitlePts {
-                    prev_pts: prev,
-                    curr_pts: pts,
-                    frame_index,
-                });
-            }
+        if let Some(prev) = self.last_subtitle_pts
+            && pts < prev
+        {
+            return Err(MuxerError::DecreasingSubtitlePts {
+                prev_pts: prev,
+                curr_pts: pts,
+                frame_index,
+            });
         }
 
         let scaled_pts = (pts * MEDIA_TIMESCALE as f64).round();
@@ -2239,16 +2239,16 @@ fn detect_keyframe(codec: VideoCodec, data: &[u8], video_frame_count: u64) -> bo
     match codec {
         VideoCodec::H264 => {
             // Check for IDR NAL (type 5)
-            let has_idr = AnnexBNalIter::new(data).any(|nal| (nal[0] & 0x1f) == 5);
-            has_idr
+
+            AnnexBNalIter::new(data).any(|nal| (nal[0] & 0x1f) == 5)
         }
         VideoCodec::H265 => {
             // Check for IDR NAL (type 19-21)
-            let has_idr = AnnexBNalIter::new(data).any(|nal| {
+
+            AnnexBNalIter::new(data).any(|nal| {
                 let nal_type = (nal[0] >> 1) & 0x3f;
                 (19..=21).contains(&nal_type)
-            });
-            has_idr
+            })
         }
         VideoCodec::Av1 => {
             // For AV1, check if it's a key frame (first frame or has key frame flag)
@@ -2525,14 +2525,14 @@ impl<Writer: Write + std::io::Seek> StreamingMuxer<Writer> {
         if pts < 0.0 {
             return Err(MuxerError::NegativeVideoPts { pts, frame_index });
         }
-        if let Some(prev) = self.last_video_pts {
-            if pts <= prev {
-                return Err(MuxerError::NonIncreasingVideoPts {
-                    prev_pts: prev,
-                    curr_pts: pts,
-                    frame_index,
-                });
-            }
+        if let Some(prev) = self.last_video_pts
+            && pts <= prev
+        {
+            return Err(MuxerError::NonIncreasingVideoPts {
+                prev_pts: prev,
+                curr_pts: pts,
+                frame_index,
+            });
         }
         let pts_u = (pts * MEDIA_TIMESCALE as f64).round() as u64;
         self.push_video(pts_u, pts_u, data, is_keyframe, None)
@@ -2565,14 +2565,14 @@ impl<Writer: Write + std::io::Seek> StreamingMuxer<Writer> {
         if dts < 0.0 {
             return Err(MuxerError::NegativeVideoDts { dts, frame_index });
         }
-        if let Some(prev_dts) = self.last_video_dts {
-            if dts <= prev_dts {
-                return Err(MuxerError::NonIncreasingDts {
-                    prev_dts,
-                    curr_dts: dts,
-                    frame_index,
-                });
-            }
+        if let Some(prev_dts) = self.last_video_dts
+            && dts <= prev_dts
+        {
+            return Err(MuxerError::NonIncreasingDts {
+                prev_dts,
+                curr_dts: dts,
+                frame_index,
+            });
         }
         let pts_u = (pts * MEDIA_TIMESCALE as f64).round() as u64;
         let dts_u = (dts * MEDIA_TIMESCALE as f64).round() as u64;
@@ -2668,14 +2668,14 @@ impl<Writer: Write + std::io::Seek> StreamingMuxer<Writer> {
         if data.is_empty() {
             return Err(MuxerError::EmptyAudioFrame { frame_index });
         }
-        if let Some(prev) = self.last_audio_pts {
-            if pts < prev {
-                return Err(MuxerError::DecreasingAudioPts {
-                    prev_pts: prev,
-                    curr_pts: pts,
-                    frame_index,
-                });
-            }
+        if let Some(prev) = self.last_audio_pts
+            && pts < prev
+        {
+            return Err(MuxerError::DecreasingAudioPts {
+                prev_pts: prev,
+                curr_pts: pts,
+                frame_index,
+            });
         }
         let pts_u = (pts * MEDIA_TIMESCALE as f64).round() as u64;
         self.push_audio(pts_u, data, None)
@@ -2777,14 +2777,14 @@ impl<Writer: Write + std::io::Seek> StreamingMuxer<Writer> {
         if text.is_empty() {
             return Err(MuxerError::EmptySubtitleSample { frame_index });
         }
-        if let Some(prev) = self.last_subtitle_pts {
-            if pts < prev {
-                return Err(MuxerError::DecreasingSubtitlePts {
-                    prev_pts: prev,
-                    curr_pts: pts,
-                    frame_index,
-                });
-            }
+        if let Some(prev) = self.last_subtitle_pts
+            && pts < prev
+        {
+            return Err(MuxerError::DecreasingSubtitlePts {
+                prev_pts: prev,
+                curr_pts: pts,
+                frame_index,
+            });
         }
         let pts_u = (pts * MEDIA_TIMESCALE as f64).round() as u64;
         let dur_u = (duration * MEDIA_TIMESCALE as f64).round().max(1.0) as u32;
@@ -2902,14 +2902,14 @@ impl<Writer: Write> MkvMuxer<Writer> {
         if pts < 0.0 {
             return Err(MuxerError::NegativeVideoPts { pts, frame_index });
         }
-        if let Some(prev) = self.last_video_pts {
-            if pts <= prev {
-                return Err(MuxerError::NonIncreasingVideoPts {
-                    prev_pts: prev,
-                    curr_pts: pts,
-                    frame_index,
-                });
-            }
+        if let Some(prev) = self.last_video_pts
+            && pts <= prev
+        {
+            return Err(MuxerError::NonIncreasingVideoPts {
+                prev_pts: prev,
+                curr_pts: pts,
+                frame_index,
+            });
         }
 
         let scaled_pts = (pts * MEDIA_TIMESCALE as f64).round();
@@ -2962,14 +2962,14 @@ impl<Writer: Write> MkvMuxer<Writer> {
         if dts < 0.0 {
             return Err(MuxerError::NegativeVideoDts { dts, frame_index });
         }
-        if let Some(prev_dts) = self.last_video_dts {
-            if dts <= prev_dts {
-                return Err(MuxerError::NonIncreasingDts {
-                    prev_dts,
-                    curr_dts: dts,
-                    frame_index,
-                });
-            }
+        if let Some(prev_dts) = self.last_video_dts
+            && dts <= prev_dts
+        {
+            return Err(MuxerError::NonIncreasingDts {
+                prev_dts,
+                curr_dts: dts,
+                frame_index,
+            });
         }
 
         let scaled_pts = (pts * MEDIA_TIMESCALE as f64).round();
@@ -3060,14 +3060,14 @@ impl<Writer: Write> MkvMuxer<Writer> {
         if data.is_empty() {
             return Err(MuxerError::EmptyAudioFrame { frame_index });
         }
-        if let Some(prev) = self.last_audio_pts {
-            if pts < prev {
-                return Err(MuxerError::DecreasingAudioPts {
-                    prev_pts: prev,
-                    curr_pts: pts,
-                    frame_index,
-                });
-            }
+        if let Some(prev) = self.last_audio_pts
+            && pts < prev
+        {
+            return Err(MuxerError::DecreasingAudioPts {
+                prev_pts: prev,
+                curr_pts: pts,
+                frame_index,
+            });
         }
         // Verdict §7: audio may begin before video (edit lists handle offset).
 
@@ -3118,14 +3118,14 @@ impl<Writer: Write> MkvMuxer<Writer> {
         if text.is_empty() {
             return Err(MuxerError::EmptySubtitleSample { frame_index });
         }
-        if let Some(prev) = self.last_subtitle_pts {
-            if pts < prev {
-                return Err(MuxerError::DecreasingSubtitlePts {
-                    prev_pts: prev,
-                    curr_pts: pts,
-                    frame_index,
-                });
-            }
+        if let Some(prev) = self.last_subtitle_pts
+            && pts < prev
+        {
+            return Err(MuxerError::DecreasingSubtitlePts {
+                prev_pts: prev,
+                curr_pts: pts,
+                frame_index,
+            });
         }
 
         let scaled_pts = (pts * MEDIA_TIMESCALE as f64).round();

@@ -3,7 +3,7 @@ use std::{env, fs::File, io::Write, path::PathBuf};
 
 fn read_hex_bytes(contents: &str) -> Vec<u8> {
     let hex: String = contents.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(hex.len() % 2 == 0, "hex must have even length");
+    assert!(hex.len().is_multiple_of(2), "hex must have even length");
 
     let mut out = Vec::with_capacity(hex.len() / 2);
     for i in (0..hex.len()).step_by(2) {

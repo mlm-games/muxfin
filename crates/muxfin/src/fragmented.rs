@@ -180,13 +180,13 @@ impl FragmentedMuxer {
         is_sync: bool,
     ) -> Result<(), FragmentedError> {
         // Enforce monotonic DTS
-        if let Some(last) = self.last_dts {
-            if dts < last {
-                return Err(FragmentedError::NonMonotonicDts {
-                    prev_dts: last,
-                    curr_dts: dts,
-                });
-            }
+        if let Some(last) = self.last_dts
+            && dts < last
+        {
+            return Err(FragmentedError::NonMonotonicDts {
+                prev_dts: last,
+                curr_dts: dts,
+            });
         }
         self.last_dts = Some(dts);
 
@@ -215,7 +215,7 @@ impl FragmentedMuxer {
         );
 
         // Update state for next segment (checked; saturate instead of wrapping).
-        self.sequence_number = self.sequence_number.checked_add(1).unwrap_or(u32::MAX);
+        self.sequence_number = self.sequence_number.saturating_add(1);
         if let Some(last) = samples.last() {
             // Estimate next base_media_decode_time
             if samples.len() >= 2 {

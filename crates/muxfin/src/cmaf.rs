@@ -116,16 +116,16 @@ impl CmafProfile {
                     actual: config.timescale,
                 });
             }
-            if let Some((max_w, max_h)) = self.max_resolution() {
-                if config.width > max_w || config.height > max_h {
-                    return Err(CmafError::ResolutionTooLarge {
-                        profile: self.brand_str(),
-                        width: config.width,
-                        height: config.height,
-                        max_width: max_w,
-                        max_height: max_h,
-                    });
-                }
+            if let Some((max_w, max_h)) = self.max_resolution()
+                && (config.width > max_w || config.height > max_h)
+            {
+                return Err(CmafError::ResolutionTooLarge {
+                    profile: self.brand_str(),
+                    width: config.width,
+                    height: config.height,
+                    max_width: max_w,
+                    max_height: max_h,
+                });
             }
             if config.fragment_duration_ms < 250 || config.fragment_duration_ms > 30_000 {
                 return Err(CmafError::FragmentDurationOutOfRange {
@@ -173,13 +173,11 @@ impl CmafProfile {
                     });
                 }
             }
-            (CmafProfile::Flac, Some(codec)) => {
-                if codec != crate::api::AudioCodec::Flac {
-                    return Err(CmafError::CodecMismatch {
-                        profile: self.brand_str(),
-                        detail: "cfla requires FLAC",
-                    });
-                }
+            (CmafProfile::Flac, Some(codec)) if codec != crate::api::AudioCodec::Flac => {
+                return Err(CmafError::CodecMismatch {
+                    profile: self.brand_str(),
+                    detail: "cfla requires FLAC",
+                });
             }
             _ => {}
         }

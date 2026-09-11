@@ -645,10 +645,10 @@ pub fn is_av1_keyframe(data: &[u8]) -> bool {
                         continue;
                     }
                     // frame_type: 2 bits
-                    if let Some(frame_type_val) = reader.read_bits(2) {
-                        if frame_type_val as u8 == frame_type::KEY_FRAME {
-                            return true;
-                        }
+                    if let Some(frame_type_val) = reader.read_bits(2)
+                        && frame_type_val as u8 == frame_type::KEY_FRAME
+                    {
+                        return true;
                     }
                 }
             }

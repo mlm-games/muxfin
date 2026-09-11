@@ -170,8 +170,8 @@ impl SampleTables {
             .iter()
             .map(|sample| {
                 let diff = sample.pts as i64 - sample.dts as i64;
-                let offset = i32::try_from(diff)
-                    .unwrap_or_else(|_| if diff > 0 { i32::MAX } else { i32::MIN });
+                let offset =
+                    i32::try_from(diff).unwrap_or(if diff > 0 { i32::MAX } else { i32::MIN });
                 if offset != 0 {
                     has_bframes = true;
                 }
@@ -405,10 +405,10 @@ impl fmt::Display for AdtsValidationError {
         }
 
         // Add technical details in verbose mode (if requested)
-        if f.alternate() {
-            if let Some(tech) = &self.technical_details {
-                write!(f, "\n🔍 Technical details: {}", tech)?;
-            }
+        if f.alternate()
+            && let Some(tech) = &self.technical_details
+        {
+            write!(f, "\n🔍 Technical details: {}", tech)?;
         }
 
         // Show related errors
@@ -905,10 +905,10 @@ impl<Writer: Write> Mp4Writer<Writer> {
         if self.subtitle_track.is_none() {
             return Err(Mp4WriterError::SubtitleNotEnabled);
         }
-        if let Some(prev) = self.subtitle_prev_pts {
-            if pts < prev {
-                return Err(Mp4WriterError::NonIncreasingTimestamp);
-            }
+        if let Some(prev) = self.subtitle_prev_pts
+            && pts < prev
+        {
+            return Err(Mp4WriterError::NonIncreasingTimestamp);
         }
         if data.is_empty() {
             return Err(Mp4WriterError::Io(io::Error::new(
@@ -1863,15 +1863,15 @@ pub(crate) fn build_moov_box(
     if let Some(f) = video_tables.first_pts {
         origins.push(f);
     }
-    if let Some((_, t)) = audio {
-        if let Some(f) = t.first_pts {
-            origins.push(f);
-        }
+    if let Some((_, t)) = audio
+        && let Some(f) = t.first_pts
+    {
+        origins.push(f);
     }
-    if let Some((_, t)) = subtitle {
-        if let Some(f) = t.first_pts {
-            origins.push(f);
-        }
+    if let Some((_, t)) = subtitle
+        && let Some(f) = t.first_pts
+    {
+        origins.push(f);
     }
     let origin = origins.into_iter().min().unwrap_or(0);
     let trak_box = build_trak_box_with_edts(
@@ -2547,11 +2547,11 @@ fn build_stsd_box(video: &Mp4VideoTrack, video_config: &VideoConfig) -> Vec<u8> 
 fn build_stts_box(durations: &[u32]) -> Vec<u8> {
     let mut entries: Vec<(u32, u32)> = Vec::new();
     for &duration in durations {
-        if let Some(last) = entries.last_mut() {
-            if last.1 == duration {
-                last.0 += 1;
-                continue;
-            }
+        if let Some(last) = entries.last_mut()
+            && last.1 == duration
+        {
+            last.0 += 1;
+            continue;
         }
         entries.push((1u32, duration));
     }
@@ -2650,11 +2650,11 @@ fn build_ctts_box(cts_offsets: &[i32]) -> Vec<u8> {
     // Run-length encode the offsets
     let mut entries: Vec<(u32, i32)> = Vec::new();
     for &offset in cts_offsets {
-        if let Some(last) = entries.last_mut() {
-            if last.1 == offset {
-                last.0 += 1;
-                continue;
-            }
+        if let Some(last) = entries.last_mut()
+            && last.1 == offset
+        {
+            last.0 += 1;
+            continue;
         }
         entries.push((1, offset));
     }
@@ -3446,7 +3446,7 @@ fn days_to_ymd(days: u64) -> (u32, u32, u32) {
 }
 
 fn is_leap_year(year: u32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
 #[cfg(test)]

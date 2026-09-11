@@ -11,7 +11,10 @@ fn read_hex_fixture(dir: &str, name: &str) -> Vec<u8> {
         .join(name);
     let contents = fs::read_to_string(path).expect("fixture must be readable");
     let hex: String = contents.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(hex.len() % 2 == 0, "hex fixtures must have even length");
+    assert!(
+        hex.len().is_multiple_of(2),
+        "hex fixtures must have even length"
+    );
 
     let mut out = Vec::with_capacity(hex.len() / 2);
     for i in (0..hex.len()).step_by(2) {

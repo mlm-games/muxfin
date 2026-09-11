@@ -256,10 +256,8 @@ fn parse_color_config(r: &mut BitReader<'_>, profile: u8) -> Result<ColorConfig,
     let (subsampling_x, subsampling_y, full_range) = if color_space == CS_RGB {
         // sRGB: full range, 4:4:4. Profiles 1/3 still carry a reserved
         // zero bit here (libvpx `read_bitdepth_colorspace_sampling`).
-        if profile == 1 || profile == 3 {
-            if r.read(1)? != 0 {
-                return Err(Vp9Error::ParseError("VP9 reserved bit set".into()));
-            }
+        if (profile == 1 || profile == 3) && r.read(1)? != 0 {
+            return Err(Vp9Error::ParseError("VP9 reserved bit set".into()));
         }
         (false, false, true)
     } else {
