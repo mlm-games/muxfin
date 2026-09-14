@@ -325,7 +325,7 @@ impl Metadata {
 
     /// Set creation time to current system time
     pub fn with_current_time(mut self) -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use web_time::{SystemTime, UNIX_EPOCH};
         if let Ok(duration) = SystemTime::now().duration_since(UNIX_EPOCH) {
             self.creation_time = Some(duration.as_secs());
         }
@@ -3974,15 +3974,15 @@ mod tests {
 
     #[test]
     fn metadata_with_current_time_sets_current_timestamp() {
-        let before = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let before = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
         let metadata = Metadata::new().with_current_time();
 
-        let after = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let after = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
