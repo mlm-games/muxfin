@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "muxfin"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "bytes",
  "criterion",
@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "muxfin-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -725,14 +725,14 @@ dependencies = [
 
 [[package]]
 name = "muxfin-ffi"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "muxfin",
 ]
 
 [[package]]
 name = "muxfin-wasm"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "muxfin",
  "muxfin-ffi",
