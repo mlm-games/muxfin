@@ -15,6 +15,7 @@
 //! - Outputs MP4 files with fast-start (moov before mdat) for instant web playback
 //! - Outputs Matroska (MKV) and WebM via [`api::MkvMuxer`] (EBML via the
 //!   external `mkv-element` crate)
+//! - Outputs Ogg Opus (`.ogg`/`.opus`) via [`api::OggMuxer`]
 //! - Supports B-frames via explicit PTS/DTS
 //! - Supports fragmented MP4 (fMP4) for DASH/HLS streaming
 //!

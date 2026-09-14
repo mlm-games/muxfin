@@ -8,7 +8,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::Serialize;
 
 use muxfin::api::{
-    AacProfile, AudioCodec, ContainerFormat, Metadata, MkvMuxer, Muxer, MuxerBuilder, VideoCodec,
+    AacProfile, AudioCodec, ContainerFormat, FlacMuxer, Metadata, MkvMuxer, Muxer, MuxerBuilder,
+    OggMuxer, VideoCodec,
 };
 use muxfin::assert_invariant;
 use muxfin::demux::{FlacStream, OggOpusTrack, demux_flac, demux_ogg_opus};
@@ -69,7 +70,7 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
 
-        /// Output container: mp4, mkv/matroska, webm (default: mp4)
+        /// Output container: mp4, mkv/matroska, webm, ogg/opus, flac (default: mp4)
         #[arg(long, default_value = "mp4")]
         format: ContainerFormat,
 
@@ -880,7 +881,77 @@ fn mux_command(
     }
 
     // Build the muxer for the selected container.
-    if format.is_matroska_family() {
+    if format == ContainerFormat::Ogg {
+        if video.is_some() {
+            anyhow::bail!(
+                "Ogg output carries Opus audio only; omit --video or use --format mp4/mkv/webm"
+            );
+        }
+        let mut muxer = builder
+            .build_ogg()
+            .with_context(|| format!("Failed to build {} muxer", format))?;
+
+        if let Some(input) = &audio_input {
+            process_audio_frames(input, &mut muxer, &mut progress, verbose)?;
+        }
+
+        if verbose {
+            eprintln!("Finalizing {}...", format);
+        }
+
+        // Invariant: Ogg output requires an audio stream.
+        assert_invariant!(
+            audio.is_some(),
+            "Ogg output requires an audio stream",
+            "cli::mux_command"
+        );
+
+        // Invariant: Output file must be writable
+        assert_invariant!(
+            output.metadata().is_ok(),
+            "Output file path must be writable",
+            "cli::mux_command"
+        );
+
+        muxer
+            .finish()
+            .with_context(|| format!("Failed to finalize {}", format))?;
+    } else if format == ContainerFormat::Flac {
+        if video.is_some() {
+            anyhow::bail!(
+                "FLAC output carries FLAC audio only; omit --video or use --format mp4/mkv/webm"
+            );
+        }
+        let mut muxer = builder
+            .build_flac()
+            .with_context(|| format!("Failed to build {} muxer", format))?;
+
+        if let Some(input) = &audio_input {
+            process_audio_frames(input, &mut muxer, &mut progress, verbose)?;
+        }
+
+        if verbose {
+            eprintln!("Finalizing {}...", format);
+        }
+
+        // Invariant: FLAC output requires an audio stream.
+        assert_invariant!(
+            audio.is_some(),
+            "FLAC output requires an audio stream",
+            "cli::mux_command"
+        );
+
+        // Invariant: Output file must be writable
+        assert_invariant!(
+            output.metadata().is_ok(),
+            "Output file path must be writable",
+            "cli::mux_command"
+        );
+
+        muxer
+            .finish()
+            .with_context(|| format!("Failed to finalize {}", format))?;
+    } else if format.is_matroska_family() {
         let mut muxer = builder
             .with_container(format)
             .build_mkv()
@@ -998,6 +1069,28 @@ impl MediaSink for MkvMuxer<File> {
     fn push_video(&mut self, pts: f64, data: &[u8]) -> Result<()> {
         self.write_video(pts, data, true)
             .with_context(|| "Failed to write video frame")
+    }
+
+    fn push_audio(&mut self, pts: f64, data: &[u8]) -> Result<()> {
+        self.write_audio(pts, data)
+            .with_context(|| "Failed to write audio frame")
+    }
+}
+
+impl MediaSink for OggMuxer<File> {
+    fn push_video(&mut self, _pts: f64, _data: &[u8]) -> Result<()> {
+        anyhow::bail!("Ogg output carries Opus audio only (no video track)")
+    }
+
+    fn push_audio(&mut self, pts: f64, data: &[u8]) -> Result<()> {
+        self.write_audio(pts, data)
+            .with_context(|| "Failed to write audio frame")
+    }
+}
+
+impl MediaSink for FlacMuxer<File> {
+    fn push_video(&mut self, _pts: f64, _data: &[u8]) -> Result<()> {
+        anyhow::bail!("FLAC output carries FLAC audio only (no video track)")
     }
 
     fn push_audio(&mut self, pts: f64, data: &[u8]) -> Result<()> {

@@ -2,6 +2,7 @@ use crate::assert_invariant;
 use crate::codec::common::AnnexBNalIter;
 use crate::codec::vp9::is_vp9_keyframe;
 use crate::fragmented::{FragmentConfig, FragmentedMuxer};
+use crate::muxer::flac::{FlacWriter, FlacWriterError};
 use crate::muxer::mkv::{MkvContainer, MkvWriter, MkvWriterError};
 /// Public API definitions for the Muxfin crate.
 ///
@@ -13,6 +14,7 @@ use crate::muxer::mkv::{MkvContainer, MkvWriter, MkvWriterError};
 use crate::muxer::mp4::{
     MEDIA_TIMESCALE, Mp4AudioTrack, Mp4SubtitleTrack, Mp4VideoTrack, Mp4Writer, Mp4WriterError,
 };
+use crate::muxer::ogg::{OggWriter, OggWriterError};
 use crate::muxer::streaming::SeekableStreamingWriter;
 use crate::time::{EncodedSample, LanguageCode, Limits, SubtitleCue};
 use std::fmt;
@@ -230,6 +232,10 @@ pub enum ContainerFormat {
     Matroska,
     /// WebM (`.webm`): VP9/AV1 video and Opus audio only; see [`MkvMuxer`].
     WebM,
+    /// Ogg Opus (`.ogg`/`.opus`): Opus audio only; see [`OggMuxer`].
+    Ogg,
+    /// Native FLAC (`.flac`): FLAC audio only; see [`FlacMuxer`].
+    Flac,
 }
 
 impl ContainerFormat {
@@ -239,6 +245,8 @@ impl ContainerFormat {
             ContainerFormat::Mp4 => "mp4",
             ContainerFormat::Matroska => "mkv",
             ContainerFormat::WebM => "webm",
+            ContainerFormat::Ogg => "ogg",
+            ContainerFormat::Flac => "flac",
         }
     }
 
@@ -254,6 +262,8 @@ impl fmt::Display for ContainerFormat {
             ContainerFormat::Mp4 => write!(f, "MP4"),
             ContainerFormat::Matroska => write!(f, "Matroska"),
             ContainerFormat::WebM => write!(f, "WebM"),
+            ContainerFormat::Ogg => write!(f, "Ogg"),
+            ContainerFormat::Flac => write!(f, "FLAC"),
         }
     }
 }
@@ -266,8 +276,10 @@ impl std::str::FromStr for ContainerFormat {
             "mp4" | "m4v" | "isobmff" => Ok(ContainerFormat::Mp4),
             "mkv" | "matroska" | "mka" => Ok(ContainerFormat::Matroska),
             "webm" => Ok(ContainerFormat::WebM),
+            "ogg" | "opus" | "oga" => Ok(ContainerFormat::Ogg),
+            "flac" | "fla" => Ok(ContainerFormat::Flac),
             _ => Err(format!(
-                "Unknown container format: {} (expected mp4, mkv, or webm)",
+                "Unknown container format: {} (expected mp4, mkv, webm, ogg, or flac)",
                 s
             )),
         }
@@ -1076,7 +1088,10 @@ impl<Writer> MuxerBuilder<Writer> {
     {
         validate_opus_config(self.opus_config.as_ref())?;
         let container = match self.container {
-            ContainerFormat::Mp4 | ContainerFormat::Matroska => MkvContainer::Matroska,
+            ContainerFormat::Mp4
+            | ContainerFormat::Matroska
+            | ContainerFormat::Ogg
+            | ContainerFormat::Flac => MkvContainer::Matroska,
             ContainerFormat::WebM => MkvContainer::WebM,
         };
 
@@ -1203,6 +1218,217 @@ impl<Writer> MuxerBuilder<Writer> {
             finished: false,
             current_video_pts: 0.0,
             current_audio_pts: 0.0,
+        })
+    }
+
+    /// Finalise the builder and produce an [`OggMuxer`] instance.
+    ///
+    /// Ogg carries Opus audio only: configuring video or subtitles, or an
+    /// audio codec other than Opus, fails with [`MuxerError`] (fail fast,
+    /// no silent downmix).
+    ///
+    /// ```no_run
+    /// use muxfin::api::{AudioCodec, MuxerBuilder};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut muxer = MuxerBuilder::new(Vec::<u8>::new())
+    ///     .audio(AudioCodec::Opus, 48_000, 2)
+    ///     .build_ogg()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no audio track is configured, the audio codec
+    /// is not Opus, a video/subtitle track is configured, or the channel
+    /// count cannot be expressed in an `OpusHead` packet.
+    pub fn build_ogg(self) -> Result<OggMuxer<Writer>, MuxerError>
+    where
+        Writer: Write,
+    {
+        validate_opus_config(self.opus_config.as_ref())?;
+        if self.video.is_some() {
+            return Err(MuxerError::UnsupportedForContainer {
+                codec: self
+                    .video
+                    .map(|(codec, _, _, _)| codec.to_string())
+                    .unwrap_or_else(|| "video".to_string()),
+                container: ContainerFormat::Ogg.to_string(),
+                reason: "Ogg carries Opus audio only; use MP4 or Matroska for video".to_string(),
+            });
+        }
+        if self.subtitle.is_some() {
+            return Err(MuxerError::UnsupportedForContainer {
+                codec: "subtitle".to_string(),
+                container: ContainerFormat::Ogg.to_string(),
+                reason: "Ogg carries Opus audio only; use MP4 or Matroska for subtitles"
+                    .to_string(),
+            });
+        }
+        let audio = self.audio.ok_or(MuxerError::MissingConfig)?;
+        let (codec, sample_rate, channels) = audio;
+        if codec != AudioCodec::Opus {
+            return Err(MuxerError::UnsupportedForContainer {
+                codec: codec.to_string(),
+                container: ContainerFormat::Ogg.to_string(),
+                reason: "Ogg carries Opus audio only".to_string(),
+            });
+        }
+        let mut audio_track = Some(AudioTrackConfig {
+            codec,
+            sample_rate,
+            channels,
+            timescale: 48_000,
+            language: LanguageCode::UND,
+        });
+        if let (Some(t), Some(lang)) = (audio_track.as_mut(), self.audio_language) {
+            t.language = lang;
+        }
+        let audio_track = audio_track.expect("audio track set above");
+
+        let mut writer = OggWriter::new(self.writer);
+        writer.enable_audio(Mp4AudioTrack {
+            sample_rate: audio_track.sample_rate,
+            channels: audio_track.channels,
+            codec: audio_track.codec,
+            flac_streaminfo: None,
+            opus_preskip: self.opus_preskip,
+            aac_asc_override: None,
+            opus_config_override: self.opus_config.clone(),
+            language: Some(String::from_utf8_lossy(&audio_track.language.as_bytes()).into_owned()),
+        });
+
+        Ok(OggMuxer {
+            writer,
+            metadata: self.metadata,
+            limits: self.limits,
+            last_audio_pts: None,
+            audio_frame_count: 0,
+            finished: false,
+        })
+    }
+
+    /// Finalise the builder and produce a [`FlacMuxer`] instance.
+    ///
+    /// Native FLAC carries FLAC audio only: configuring video or
+    /// subtitles, or an audio codec other than FLAC, fails with
+    /// [`MuxerError`]. A valid 34-byte STREAMINFO must be supplied with
+    /// [`MuxerBuilder::with_flac_streaminfo`] (obtain it from
+    /// [`crate::demux::FlacStream::streaminfo_raw`]); block sizes, rate,
+    /// channels and bits-per-sample are copied verbatim, while total
+    /// samples and min/max frame size are recomputed from the queued
+    /// frames at finalize time.
+    ///
+    /// ```no_run
+    /// use muxfin::api::{AudioCodec, MuxerBuilder};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let streaminfo = muxfin::codec::flac::build_streaminfo(4096, 4096, 44_100, 2, 16, 0);
+    /// let mut muxer = MuxerBuilder::new(Vec::<u8>::new())
+    ///     .audio(AudioCodec::Flac, 44_100, 2)
+    ///     .with_flac_streaminfo(streaminfo.to_vec())
+    ///     .build_flac()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no FLAC audio track is configured, a
+    /// video/subtitle track is configured, or STREAMINFO is missing or
+    /// disagrees with the track parameters.
+    pub fn build_flac(self) -> Result<FlacMuxer<Writer>, MuxerError>
+    where
+        Writer: Write,
+    {
+        if self.video.is_some() {
+            return Err(MuxerError::UnsupportedForContainer {
+                codec: self
+                    .video
+                    .map(|(codec, _, _, _)| codec.to_string())
+                    .unwrap_or_else(|| "video".to_string()),
+                container: ContainerFormat::Flac.to_string(),
+                reason: "native FLAC carries FLAC audio only; use MP4 or Matroska for video"
+                    .to_string(),
+            });
+        }
+        if self.subtitle.is_some() {
+            return Err(MuxerError::UnsupportedForContainer {
+                codec: "subtitle".to_string(),
+                container: ContainerFormat::Flac.to_string(),
+                reason: "native FLAC carries FLAC audio only; use MP4 or Matroska for subtitles"
+                    .to_string(),
+            });
+        }
+        let audio = self.audio.ok_or(MuxerError::MissingConfig)?;
+        let (codec, sample_rate, channels) = audio;
+        if codec != AudioCodec::Flac {
+            return Err(MuxerError::UnsupportedForContainer {
+                codec: codec.to_string(),
+                container: ContainerFormat::Flac.to_string(),
+                reason: "native FLAC carries FLAC frames only".to_string(),
+            });
+        }
+        let mut audio_track = Some(AudioTrackConfig {
+            codec,
+            sample_rate,
+            channels,
+            timescale: sample_rate,
+            language: LanguageCode::UND,
+        });
+        if let (Some(t), Some(lang)) = (audio_track.as_mut(), self.audio_language) {
+            t.language = lang;
+        }
+        let audio_track = audio_track.expect("audio track set above");
+
+        let streaminfo = self.flac_streaminfo.clone().ok_or_else(|| {
+            MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "valid FLAC STREAMINFO (34 bytes) must be provided for FLAC audio using with_flac_streaminfo()",
+            ))
+        })?;
+        let parsed = crate::codec::flac::parse_streaminfo(&streaminfo).ok_or_else(|| {
+            MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "FLAC STREAMINFO must be a valid 34-byte STREAMINFO block",
+            ))
+        })?;
+        if audio_track.sample_rate != parsed.sample_rate
+            || audio_track.channels != u16::from(parsed.channels)
+        {
+            return Err(MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "FLAC track parameters ({} Hz, {} ch) disagree with STREAMINFO ({} Hz, {} ch)",
+                    audio_track.sample_rate,
+                    audio_track.channels,
+                    parsed.sample_rate,
+                    parsed.channels
+                ),
+            )));
+        }
+
+        let mut writer = FlacWriter::new(self.writer);
+        writer.enable_audio(Mp4AudioTrack {
+            sample_rate: audio_track.sample_rate,
+            channels: audio_track.channels,
+            codec: audio_track.codec,
+            flac_streaminfo: Some(streaminfo),
+            opus_preskip: None,
+            aac_asc_override: None,
+            opus_config_override: None,
+            language: Some(String::from_utf8_lossy(&audio_track.language.as_bytes()).into_owned()),
+        });
+
+        Ok(FlacMuxer {
+            writer,
+            audio_track,
+            metadata: self.metadata,
+            limits: self.limits,
+            last_audio_pts: None,
+            audio_frame_count: 0,
+            finished: false,
         })
     }
 }
@@ -3310,7 +3536,348 @@ impl<Writer: Write> MkvMuxer<Writer> {
     }
 }
 
-// Static assertions for thread safety
+/// Ogg Opus muxer: Opus-audio-only output (`.ogg`/`.opus`).
+///
+/// Produced by [`MuxerBuilder::build_ogg`]. Timestamp validation and the
+/// error vocabulary mirror [`Muxer`]; only the container encoding differs
+/// (Ogg pages per RFC 7845 instead of ISO-BMFF boxes). `OggMuxer<W>` is
+/// `Send` when `W: Send` and `Sync` when `W: Sync`.
+pub struct OggMuxer<Writer> {
+    writer: OggWriter<Writer>,
+    metadata: Option<Metadata>,
+    last_audio_pts: Option<f64>,
+    audio_frame_count: u64,
+    finished: bool,
+    limits: Limits,
+}
+
+impl<Writer: Write> OggMuxer<Writer> {
+    /// Which container this muxer writes (always [`ContainerFormat::Ogg`]).
+    pub fn container(&self) -> ContainerFormat {
+        ContainerFormat::Ogg
+    }
+
+    /// Convert an internal [`OggWriterError`] to [`MuxerError`] with context.
+    fn convert_ogg_error(&self, err: OggWriterError, frame_index: u64) -> MuxerError {
+        match err {
+            OggWriterError::NonIncreasingTimestamp => MuxerError::DecreasingAudioPts {
+                prev_pts: self.last_audio_pts.unwrap_or(0.0),
+                curr_pts: 0.0,
+                frame_index,
+            },
+            OggWriterError::InvalidOpusPacket => MuxerError::InvalidOpusPacket { frame_index },
+            OggWriterError::InvalidOpusConfig { reason } => {
+                MuxerError::InvalidOpusConfig { reason }
+            }
+            OggWriterError::AudioNotEnabled => MuxerError::AudioNotConfigured,
+            OggWriterError::UnsupportedCodec { codec, reason } => {
+                MuxerError::UnsupportedForContainer {
+                    codec,
+                    container: ContainerFormat::Ogg.to_string(),
+                    reason,
+                }
+            }
+            OggWriterError::AlreadyFinalized => MuxerError::AlreadyFinished,
+            OggWriterError::Io(err) => MuxerError::Io(err),
+        }
+    }
+
+    /// Write an audio frame to the container.
+    ///
+    /// `pts` is the presentation timestamp in seconds. The `data` slice
+    /// holds one raw Opus packet (its TOC duration drives the granule
+    /// position). Audio timestamps must be non-decreasing.
+    pub fn write_audio(&mut self, pts: f64, data: &[u8]) -> Result<(), MuxerError> {
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+
+        let frame_index = self.audio_frame_count;
+
+        if !pts.is_finite() {
+            return Err(MuxerError::InvalidAudioPts { pts, frame_index });
+        }
+        if pts < 0.0 {
+            return Err(MuxerError::NegativeAudioPts { pts, frame_index });
+        }
+        if data.is_empty() {
+            return Err(MuxerError::EmptyAudioFrame { frame_index });
+        }
+        if let Some(prev) = self.last_audio_pts
+            && pts < prev
+        {
+            return Err(MuxerError::DecreasingAudioPts {
+                prev_pts: prev,
+                curr_pts: pts,
+                frame_index,
+            });
+        }
+        if data.len() > self.limits.max_sample_size {
+            return Err(MuxerError::ResourceLimitExceeded {
+                what: "audio sample",
+            });
+        }
+
+        let scaled_pts = (pts * crate::muxer::ogg::OPUS_CLOCK_HZ as f64).round();
+        let pts_units = scaled_pts as u64;
+
+        self.writer
+            .write_audio_sample(pts_units, data)
+            .map_err(|e| self.convert_ogg_error(e, frame_index))?;
+
+        self.last_audio_pts = Some(pts);
+        self.audio_frame_count += 1;
+        Ok(())
+    }
+
+    /// Write an audio sample with integer timestamps (verdict §§3-4).
+    /// Ogg twin of [`Muxer::write_audio_sample`]; enforces `limits` and
+    /// rejects zero-duration samples like the other frontends.
+    pub fn write_audio_sample(&mut self, sample: EncodedSample<'_>) -> Result<(), MuxerError> {
+        if sample.timing.duration == 0 {
+            return Err(MuxerError::ZeroDuration);
+        }
+        if sample.data.len() > self.limits.max_sample_size {
+            return Err(MuxerError::ResourceLimitExceeded {
+                what: "audio sample",
+            });
+        }
+        let pts_s = sample.timing.pts as f64 / crate::muxer::ogg::OPUS_CLOCK_HZ as f64;
+        self.write_audio(pts_s, sample.data)
+    }
+
+    /// Finalise the container and flush any buffered data.
+    pub fn finish_in_place(&mut self) -> Result<(), MuxerError> {
+        self.finish_in_place_with_stats().map(|_| ())
+    }
+
+    /// Finalise the container and return muxing statistics.
+    pub fn finish_in_place_with_stats(&mut self) -> Result<MuxerStats, MuxerError> {
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+        self.writer.finalize(self.metadata.as_ref()).map_err(|e| {
+            // `finalize` surfaces writer errors as `io::Error`; recover
+            // the structured Ogg rejection when identifiable.
+            let message = e.to_string();
+            if message.contains("cannot be carried in Ogg") || message.contains("invalid Opus") {
+                MuxerError::UnsupportedForContainer {
+                    codec: "configured codec".to_string(),
+                    container: ContainerFormat::Ogg.to_string(),
+                    reason: message,
+                }
+            } else {
+                MuxerError::Io(e)
+            }
+        })?;
+        self.finished = true;
+
+        let audio_frames = self.writer.audio_sample_count();
+        let bytes_written = self.writer.bytes_written();
+        let duration_secs =
+            self.writer.total_samples_48k() as f64 / crate::muxer::ogg::OPUS_CLOCK_HZ as f64;
+
+        Ok(MuxerStats {
+            video_frames: 0,
+            audio_frames,
+            subtitle_frames: 0,
+            duration_secs,
+            bytes_written,
+        })
+    }
+
+    pub fn finish(mut self) -> Result<(), MuxerError> {
+        self.finish_in_place()
+    }
+
+    /// Finalise the container and return muxing statistics.
+    pub fn finish_with_stats(mut self) -> Result<MuxerStats, MuxerError> {
+        self.finish_in_place_with_stats()
+    }
+
+    /// Flush the muxer and finalize the output.
+    pub fn flush(self) -> Result<(), MuxerError> {
+        self.finish()
+    }
+}
+
+/// Native FLAC muxer: FLAC-audio-only output (`.flac`).
+///
+/// Produced by [`MuxerBuilder::build_flac`]. Timestamp validation and the
+/// error vocabulary mirror [`Muxer`]; only the container encoding differs
+/// (native FLAC stream instead of ISO-BMFF boxes). `FlacMuxer<W>` is
+/// `Send` when `W: Send` and `Sync` when `W: Sync`.
+pub struct FlacMuxer<Writer> {
+    writer: FlacWriter<Writer>,
+    audio_track: AudioTrackConfig,
+    metadata: Option<Metadata>,
+    last_audio_pts: Option<f64>,
+    audio_frame_count: u64,
+    finished: bool,
+    limits: Limits,
+}
+
+impl<Writer: Write> FlacMuxer<Writer> {
+    /// Which container this muxer writes (always [`ContainerFormat::Flac`]).
+    pub fn container(&self) -> ContainerFormat {
+        ContainerFormat::Flac
+    }
+
+    /// Convert an internal [`FlacWriterError`] to [`MuxerError`] with context.
+    fn convert_flac_error(&self, err: FlacWriterError, frame_index: u64) -> MuxerError {
+        match err {
+            FlacWriterError::NonMonotonicFrame => MuxerError::DecreasingAudioPts {
+                prev_pts: self.last_audio_pts.unwrap_or(0.0),
+                curr_pts: 0.0,
+                frame_index,
+            },
+            FlacWriterError::InvalidFlacFrame => MuxerError::InvalidFlacFrame { frame_index },
+            FlacWriterError::InconsistentFrame => MuxerError::InvalidFlacFrame { frame_index },
+            FlacWriterError::MissingStreaminfo => MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "FLAC STREAMINFO must be provided using with_flac_streaminfo()",
+            )),
+            FlacWriterError::StreaminfoMismatch { what } => MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("FLAC track parameters disagree with STREAMINFO ({what})"),
+            )),
+            FlacWriterError::AudioNotEnabled => MuxerError::AudioNotConfigured,
+            FlacWriterError::UnsupportedCodec { codec, reason } => {
+                MuxerError::UnsupportedForContainer {
+                    codec,
+                    container: ContainerFormat::Flac.to_string(),
+                    reason,
+                }
+            }
+            FlacWriterError::AlreadyFinalized => MuxerError::AlreadyFinished,
+            FlacWriterError::Io(err) => MuxerError::Io(err),
+        }
+    }
+
+    /// Write an audio frame to the container.
+    ///
+    /// `pts` is the presentation timestamp in seconds. The `data` slice
+    /// holds one complete native FLAC frame (header CRC8 + payload +
+    /// footer CRC-16). Audio timestamps must be non-decreasing; the
+    /// frame's coded number carries the authoritative sample position.
+    pub fn write_audio(&mut self, pts: f64, data: &[u8]) -> Result<(), MuxerError> {
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+
+        let frame_index = self.audio_frame_count;
+
+        if !pts.is_finite() {
+            return Err(MuxerError::InvalidAudioPts { pts, frame_index });
+        }
+        if pts < 0.0 {
+            return Err(MuxerError::NegativeAudioPts { pts, frame_index });
+        }
+        if data.is_empty() {
+            return Err(MuxerError::EmptyAudioFrame { frame_index });
+        }
+        if let Some(prev) = self.last_audio_pts
+            && pts < prev
+        {
+            return Err(MuxerError::DecreasingAudioPts {
+                prev_pts: prev,
+                curr_pts: pts,
+                frame_index,
+            });
+        }
+        if data.len() > self.limits.max_sample_size {
+            return Err(MuxerError::ResourceLimitExceeded {
+                what: "audio sample",
+            });
+        }
+
+        let rate = self.audio_track.sample_rate.max(1) as f64;
+        let scaled_pts = (pts * rate).round();
+        let pts_units = scaled_pts as u64;
+
+        self.writer
+            .write_audio_sample(pts_units, data)
+            .map_err(|e| self.convert_flac_error(e, frame_index))?;
+
+        self.last_audio_pts = Some(pts);
+        self.audio_frame_count += 1;
+        Ok(())
+    }
+
+    /// Write an audio sample with integer timestamps (verdict §§3-4).
+    /// FLAC twin of [`Muxer::write_audio_sample`]; enforces `limits` and
+    /// rejects zero-duration samples like the other frontends.
+    pub fn write_audio_sample(&mut self, sample: EncodedSample<'_>) -> Result<(), MuxerError> {
+        if sample.timing.duration == 0 {
+            return Err(MuxerError::ZeroDuration);
+        }
+        if sample.data.len() > self.limits.max_sample_size {
+            return Err(MuxerError::ResourceLimitExceeded {
+                what: "audio sample",
+            });
+        }
+        let rate = self.audio_track.sample_rate.max(1) as f64;
+        let pts_s = sample.timing.pts as f64 / rate;
+        self.write_audio(pts_s, sample.data)
+    }
+
+    /// Finalise the container and flush any buffered data.
+    pub fn finish_in_place(&mut self) -> Result<(), MuxerError> {
+        self.finish_in_place_with_stats().map(|_| ())
+    }
+
+    /// Finalise the container and return muxing statistics.
+    pub fn finish_in_place_with_stats(&mut self) -> Result<MuxerStats, MuxerError> {
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+        self.writer.finalize(self.metadata.as_ref()).map_err(|e| {
+            // `finalize` surfaces writer errors as `io::Error`; recover
+            // the structured FLAC rejection when identifiable.
+            let message = e.to_string();
+            if message.contains("cannot be carried in FLAC")
+                || message.contains("invalid FLAC")
+                || message.contains("disagree")
+            {
+                MuxerError::UnsupportedForContainer {
+                    codec: "configured codec".to_string(),
+                    container: ContainerFormat::Flac.to_string(),
+                    reason: message,
+                }
+            } else {
+                MuxerError::Io(e)
+            }
+        })?;
+        self.finished = true;
+
+        let audio_frames = self.writer.audio_sample_count();
+        let bytes_written = self.writer.bytes_written();
+        let rate = self.audio_track.sample_rate.max(1) as f64;
+        let duration_secs = self.writer.total_samples() as f64 / rate;
+
+        Ok(MuxerStats {
+            video_frames: 0,
+            audio_frames,
+            subtitle_frames: 0,
+            duration_secs,
+            bytes_written,
+        })
+    }
+
+    pub fn finish(mut self) -> Result<(), MuxerError> {
+        self.finish_in_place()
+    }
+
+    /// Finalise the container and return muxing statistics.
+    pub fn finish_with_stats(mut self) -> Result<MuxerStats, MuxerError> {
+        self.finish_in_place_with_stats()
+    }
+
+    /// Flush the muxer and finalize the output.
+    pub fn flush(self) -> Result<(), MuxerError> {
+        self.finish()
+    }
+}
 #[cfg(test)]
 mod thread_safety_tests {
     use super::*;

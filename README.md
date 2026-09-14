@@ -112,6 +112,8 @@ If input violates the contract, Muxfin **fails fast** with explicit errors—no 
 | | Demux | Ogg Opus (`.ogg`/`.opus`) and native FLAC (`.flac`) inputs, sample-accurate PTS |
 | | Matroska (MKV) | H.264/H.265/AV1/VP9 + AAC/Opus/FLAC + subtitles via `MkvMuxer` |
 | | WebM | VP9/AV1 + Opus (whitelist enforced) |
+| | Ogg Opus | Opus audio only (`.ogg`/`.opus`) via `OggMuxer` |
+| | Native FLAC | FLAC audio only (`.flac`) via `FlacMuxer` |
 | | B-frames | Explicit PTS/DTS support |
 | | Fragmented MP4 | For DASH/HLS streaming |
 | | Metadata | Title, creation time, language |
@@ -229,6 +231,40 @@ let mut muxer = MuxerBuilder::new(file)
 for packet in &ogg.packets {
     muxer.write_audio(packet.pts, &packet.data)?;
 }
+```
+
+### Ogg Opus output (`.ogg`/`.opus`)
+
+```rust
+let mut muxer = MuxerBuilder::new(file)
+    .audio(AudioCodec::Opus, 48_000, 2)
+    .with_opus_preskip(312)
+    .build_ogg()?;
+for (i, packet) in opus_packets.iter().enumerate() {
+    muxer.write_audio(i as f64 * 0.02, packet)?; // PTS in seconds
+}
+muxer.finish()?;
+```
+
+### Native FLAC output (`.flac`)
+
+```rust
+use muxfin::demux::demux_flac;
+
+let flac = demux_flac(&std::fs::read("audio.flac")?)?;
+
+let mut muxer = MuxerBuilder::new(file)
+    .audio(
+        AudioCodec::Flac,
+        flac.streaminfo.sample_rate,
+        flac.streaminfo.channels.into(),
+    )
+    .with_flac_streaminfo(flac.streaminfo_raw.to_vec())
+    .build_flac()?;
+for frame in &flac.frames {
+    muxer.write_audio(frame.pts, &frame.data)?;
+}
+muxer.finish()?;
 ```
 
 ### Fragmented MP4 (DASH/HLS)
@@ -357,7 +393,7 @@ muxfin info
 - **Audio:** AAC (all profiles), Opus, FLAC
 - **Audio inputs:** raw ADTS/Opus dumps, Ogg Opus (`.ogg`/`.opus`), native FLAC (`.flac`) — containers auto-demux with sample-accurate timestamps, no `--sample-rate`/`--channels` needed
 
-**Supported Containers:** MP4 (default), Matroska (`--format mkv`), WebM (`--format webm`)
+**Supported Containers:** MP4 (default), Matroska (`--format mkv`), WebM (`--format webm`), Ogg Opus (`--format ogg`, audio-only), native FLAC (`--format flac`, audio-only)
 
 **Features:**
 - Progress reporting with `--verbose`

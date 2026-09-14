@@ -366,8 +366,8 @@ pub fn is_valid_flac_frame(data: &[u8]) -> bool {
 /// Build a minimal synthetic FLAC frame header for tests:
 /// fixed blocking, given frame number, block size via code 0x7 + u16
 /// extra, rate from STREAMINFO, stereo independent, 16-bit from STREAMINFO.
-#[cfg(test)]
-pub(crate) fn synthetic_frame_header(coded_number: u64, block_extra: u16) -> Vec<u8> {
+#[doc(hidden)]
+pub fn synthetic_frame_header(coded_number: u64, block_extra: u16) -> Vec<u8> {
     let mut hdr = vec![0xFF, 0xF8, 0x70, 0x10];
     // UTF-8 coded number (small values fit in 1-2 bytes).
     if coded_number < 0x80 {
