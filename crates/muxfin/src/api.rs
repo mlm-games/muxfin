@@ -761,10 +761,7 @@ impl<Writer> MuxerBuilder<Writer> {
         let subtitle_track = self.subtitle;
 
         if let Some(subtitle) = &subtitle_track
-            && matches!(
-                subtitle.codec,
-                SubtitleCodec::Ssa | SubtitleCodec::Ass
-            )
+            && matches!(subtitle.codec, SubtitleCodec::Ssa | SubtitleCodec::Ass)
         {
             return Err(MuxerError::UnsupportedForContainer {
                 codec: subtitle.codec.to_string(),
@@ -918,10 +915,7 @@ impl<Writer> MuxerBuilder<Writer> {
         let subtitle_track = self.subtitle;
 
         if let Some(subtitle) = &subtitle_track
-            && matches!(
-                subtitle.codec,
-                SubtitleCodec::Ssa | SubtitleCodec::Ass
-            )
+            && matches!(subtitle.codec, SubtitleCodec::Ssa | SubtitleCodec::Ass)
         {
             return Err(MuxerError::UnsupportedForContainer {
                 codec: subtitle.codec.to_string(),
@@ -1190,10 +1184,7 @@ impl<Writer> MuxerBuilder<Writer> {
         let subtitle_track = self.subtitle;
 
         if let Some(subtitle) = &subtitle_track
-            && matches!(
-                subtitle.codec,
-                SubtitleCodec::Ssa | SubtitleCodec::Ass
-            )
+            && matches!(subtitle.codec, SubtitleCodec::Ssa | SubtitleCodec::Ass)
             && subtitle.ass_codec_private.is_none()
         {
             return Err(MuxerError::Io(std::io::Error::new(
@@ -2332,15 +2323,11 @@ impl<Writer: Write> Muxer<Writer> {
             }
         }
         // SSA/ASS never reach the MP4 writer: build() rejects them.
-        if matches!(
-            track.codec,
-            SubtitleCodec::Ssa | SubtitleCodec::Ass
-        ) {
+        if matches!(track.codec, SubtitleCodec::Ssa | SubtitleCodec::Ass) {
             return Err(MuxerError::UnsupportedForContainer {
                 codec: track.codec.to_string(),
                 container: ContainerFormat::Mp4.to_string(),
-                reason: "SSA/ASS subtitles are Matroska-only; use build_mkv()"
-                    .to_string(),
+                reason: "SSA/ASS subtitles are Matroska-only; use build_mkv()".to_string(),
             });
         }
         let encoded = match track.codec {
@@ -3064,15 +3051,11 @@ impl<Writer: Write + std::io::Seek> StreamingMuxer<Writer> {
         }
         let pts_u = u64::try_from(pts_i64).map_err(|_| MuxerError::TimestampOverflow)?;
         // SSA/ASS never reach the MP4 writer: build() rejects them.
-        if matches!(
-            track.codec,
-            SubtitleCodec::Ssa | SubtitleCodec::Ass
-        ) {
+        if matches!(track.codec, SubtitleCodec::Ssa | SubtitleCodec::Ass) {
             return Err(MuxerError::UnsupportedForContainer {
                 codec: track.codec.to_string(),
                 container: ContainerFormat::Mp4.to_string(),
-                reason: "SSA/ASS subtitles are Matroska-only; use build_mkv()"
-                    .to_string(),
+                reason: "SSA/ASS subtitles are Matroska-only; use build_mkv()".to_string(),
             });
         }
         let encoded = match track.codec {

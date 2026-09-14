@@ -958,14 +958,8 @@ fn build_subtitle_track(track: &Mp4SubtitleTrack, language: &str) -> TrackEntry 
         crate::api::SubtitleCodec::MovText | crate::api::SubtitleCodec::WebVtt => {
             ("S_TEXT/UTF8", None)
         }
-        crate::api::SubtitleCodec::Ssa => (
-            "S_TEXT/SSA",
-            track.ass_codec_private.clone(),
-        ),
-        crate::api::SubtitleCodec::Ass => (
-            "S_TEXT/ASS",
-            track.ass_codec_private.clone(),
-        ),
+        crate::api::SubtitleCodec::Ssa => ("S_TEXT/SSA", track.ass_codec_private.clone()),
+        crate::api::SubtitleCodec::Ass => ("S_TEXT/ASS", track.ass_codec_private.clone()),
     };
     base_track(
         SUBTITLE_TRACK_NUMBER,

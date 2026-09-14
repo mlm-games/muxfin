@@ -524,7 +524,10 @@ fn mkv_ass_track_roundtrip() {
     }
     assert_eq!(blocks.len(), 2);
     assert_eq!(blocks[0], "1,0,Default,,0,0,0,,{\\b1}Hi\\Nthere");
-    assert_eq!(blocks[1], "2,1,Default,Narrator,10,10,10,Banner,Second line");
+    assert_eq!(
+        blocks[1],
+        "2,1,Default,Narrator,10,10,10,Banner,Second line"
+    );
 }
 
 #[test]
@@ -538,7 +541,10 @@ fn mkv_ass_requires_codec_private() {
         Ok(_) => panic!("ASS without CodecPrivate must fail"),
         Err(e) => e,
     };
-    assert!(err.to_string().contains("CodecPrivate"), "unexpected: {err}");
+    assert!(
+        err.to_string().contains("CodecPrivate"),
+        "unexpected: {err}"
+    );
 }
 
 #[test]
@@ -552,10 +558,7 @@ fn mp4_rejects_ass_subtitles() {
         Ok(_) => panic!("ASS in MP4 must fail"),
         Err(e) => e,
     };
-    assert!(
-        err.to_string().contains("Matroska"),
-        "unexpected: {err}"
-    );
+    assert!(err.to_string().contains("Matroska"), "unexpected: {err}");
 }
 
 #[test]
