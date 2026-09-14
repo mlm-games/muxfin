@@ -2019,8 +2019,7 @@ impl<Writer: Write> Muxer<Writer> {
             };
             if !filler.is_empty() {
                 let gap = pts_u - expected_pts;
-                let filler_dur =
-                    u32::try_from(gap).map_err(|_| MuxerError::TimestampOverflow)?;
+                let filler_dur = u32::try_from(gap).map_err(|_| MuxerError::TimestampOverflow)?;
                 self.writer
                     .write_subtitle_sample(expected_pts, filler_dur, &filler)
                     .map_err(|e| self.convert_mp4_error(e, frame_index))?;
