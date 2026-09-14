@@ -207,25 +207,44 @@ impl SampleTables {
 }
 
 /// Build an `elst` inside `edts` for a track starting after movie origin.
-/// `media_time` and `segment_duration` are in the relevant timescales
-/// (media_time in media timescale, segment in movie timescale).
-fn build_edts_box(media_time: u64, segment_duration_movie: u64) -> Vec<u8> {
+/// `first_pts` is the track's first sample PTS in media ticks,
+/// `movie_duration` the full movie duration in movie ticks.
+///
+/// Emits two entries: an empty edit covering the leading gap, then media
+/// from `first_pts`. A single `{full_duration, media=first_pts}` entry
+/// would instead present media `first_pts` at movie 0, shifting the whole
+/// track early by the gap.
+fn build_edts_box(first_pts: u64, movie_duration: u64) -> Vec<u8> {
+    // Leading gap in movie ticks, rounded up so media never starts early.
+    let gap_movie =
+        ((first_pts as u128 * u128::from(MOVIE_TIMESCALE) + u128::from(MEDIA_TIMESCALE) - 1)
+            / u128::from(MEDIA_TIMESCALE)) as u64;
+    let gap_movie = gap_movie.min(movie_duration);
+    let rest_movie = movie_duration.saturating_sub(gap_movie);
+    let use_v1 = first_pts > u64::from(u32::MAX)
+        || movie_duration > u64::from(u32::MAX)
+        || gap_movie > u64::from(u32::MAX);
     let mut elst_payload = Vec::new();
-    // Use version 1 when values exceed u32.
-    let use_v1 = media_time > u64::from(u32::MAX) || segment_duration_movie > u64::from(u32::MAX);
     if use_v1 {
         elst_payload.extend_from_slice(&0x0100_0000u32.to_be_bytes());
-        elst_payload.extend_from_slice(&1u32.to_be_bytes());
-        elst_payload.extend_from_slice(&segment_duration_movie.to_be_bytes());
-        // media_time = -1 means empty edit; otherwise offset.
-        elst_payload.extend_from_slice(&(media_time as i64).to_be_bytes());
-        elst_payload.extend_from_slice(&1i16.to_be_bytes()); // media_rate_integer
-        elst_payload.extend_from_slice(&0i16.to_be_bytes()); // media_rate_fraction
+        elst_payload.extend_from_slice(&2u32.to_be_bytes());
+        elst_payload.extend_from_slice(&gap_movie.to_be_bytes());
+        elst_payload.extend_from_slice(&(-1i64).to_be_bytes());
+        elst_payload.extend_from_slice(&1i16.to_be_bytes());
+        elst_payload.extend_from_slice(&0i16.to_be_bytes());
+        elst_payload.extend_from_slice(&rest_movie.to_be_bytes());
+        elst_payload.extend_from_slice(&(first_pts as i64).to_be_bytes());
+        elst_payload.extend_from_slice(&1i16.to_be_bytes());
+        elst_payload.extend_from_slice(&0i16.to_be_bytes());
     } else {
         elst_payload.extend_from_slice(&0u32.to_be_bytes());
-        elst_payload.extend_from_slice(&1u32.to_be_bytes());
-        elst_payload.extend_from_slice(&(segment_duration_movie as u32).to_be_bytes());
-        elst_payload.extend_from_slice(&(media_time as u32 as i32).to_be_bytes());
+        elst_payload.extend_from_slice(&2u32.to_be_bytes());
+        elst_payload.extend_from_slice(&(gap_movie as u32).to_be_bytes());
+        elst_payload.extend_from_slice(&(-1i32).to_be_bytes());
+        elst_payload.extend_from_slice(&1i16.to_be_bytes());
+        elst_payload.extend_from_slice(&0i16.to_be_bytes());
+        elst_payload.extend_from_slice(&(rest_movie as u32).to_be_bytes());
+        elst_payload.extend_from_slice(&(first_pts as u32 as i32).to_be_bytes());
         elst_payload.extend_from_slice(&1i16.to_be_bytes());
         elst_payload.extend_from_slice(&0i16.to_be_bytes());
     }

@@ -802,6 +802,7 @@ impl<Writer> MuxerBuilder<Writer> {
             video_frame_count: 0,
             audio_frame_count: 0,
             subtitle_frame_count: 0,
+            subtitle_end_ticks: None,
             finished: false,
             current_video_pts: 0.0,
             current_audio_pts: 0.0,
@@ -1273,6 +1274,9 @@ pub struct Muxer<Writer> {
     video_frame_count: u64,
     audio_frame_count: u64,
     subtitle_frame_count: u64,
+    /// End of the last subtitle sample in media ticks. Gap fillers keep
+    /// sample timing duration-derived, so this is the next expected PTS.
+    subtitle_end_ticks: Option<u64>,
     finished: bool,
     current_video_pts: f64,
     current_audio_pts: f64,
@@ -2001,6 +2005,28 @@ impl<Writer: Write> Muxer<Writer> {
             return Err(MuxerError::ZeroDuration);
         }
         let pts_u = u64::try_from(pts_i64).map_err(|_| MuxerError::TimestampOverflow)?;
+        // Gap fillers: subtitle sample timing is duration-derived (no ctts
+        // on the subtitle track), so every gap needs an explicit empty tx3g
+        // sample: the leading `[0, start)` gap and gaps between cues.
+        let expected_pts = self.subtitle_end_ticks.unwrap_or(0);
+        if pts_u > expected_pts {
+            let filler = match track.codec {
+                SubtitleCodec::MovText => {
+                    crate::muxer::mp4::Mp4Writer::<Vec<u8>>::encode_tx3g_sample("")
+                        .map_err(|_| MuxerError::SubtitleTooLarge(0))?
+                }
+                SubtitleCodec::WebVtt => Vec::new(),
+            };
+            if !filler.is_empty() {
+                let gap = pts_u - expected_pts;
+                let filler_dur =
+                    u32::try_from(gap).map_err(|_| MuxerError::TimestampOverflow)?;
+                self.writer
+                    .write_subtitle_sample(expected_pts, filler_dur, &filler)
+                    .map_err(|e| self.convert_mp4_error(e, frame_index))?;
+                self.subtitle_frame_count += 1;
+            }
+        }
         let encoded = match track.codec {
             SubtitleCodec::MovText => {
                 crate::muxer::mp4::Mp4Writer::<Vec<u8>>::encode_tx3g_sample(cue.text)
@@ -2029,6 +2055,7 @@ impl<Writer: Write> Muxer<Writer> {
             .map_err(|e| self.convert_mp4_error(e, frame_index))?;
         let pts_f = pts_u as f64 / MEDIA_TIMESCALE as f64;
         self.last_subtitle_pts = Some(pts_f);
+        self.subtitle_end_ticks = Some(pts_u.saturating_add(dur_i64 as u64));
         self.subtitle_frame_count += 1;
         Ok(())
     }
