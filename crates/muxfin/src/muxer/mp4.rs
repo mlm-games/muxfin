@@ -216,8 +216,8 @@ impl SampleTables {
 /// track early by the gap.
 fn build_edts_box(first_pts: u64, movie_duration: u64) -> Vec<u8> {
     // Leading gap in movie ticks, rounded up so media never starts early.
-    let gap_movie =
-        (first_pts as u128 * u128::from(MOVIE_TIMESCALE)).div_ceil(u128::from(MEDIA_TIMESCALE)) as u64;
+    let gap_movie = (first_pts as u128 * u128::from(MOVIE_TIMESCALE))
+        .div_ceil(u128::from(MEDIA_TIMESCALE)) as u64;
     let gap_movie = gap_movie.min(movie_duration);
     let rest_movie = movie_duration.saturating_sub(gap_movie);
     let use_v1 = first_pts > u64::from(u32::MAX)
