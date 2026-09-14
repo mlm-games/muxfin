@@ -122,10 +122,10 @@ pub fn parse_dialogue_events(script: &str) -> Vec<AssEvent> {
             continue;
         }
         let get = |key: &str, fallback: usize| -> &str {
-            if let Some(cols) = &columns {
-                if let Some(pos) = cols.iter().position(|c| c == key) {
-                    return fields.get(pos).map_or("", |f| f.trim());
-                }
+            if let Some(cols) = &columns
+                && let Some(pos) = cols.iter().position(|c| c == key)
+            {
+                return fields.get(pos).map_or("", |f| f.trim());
             }
             fields.get(fallback).map_or("", |f| f.trim())
         };
