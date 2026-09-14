@@ -472,3 +472,112 @@ fn mkv_container_format_parsing() {
     assert!(ContainerFormat::WebM.is_matroska_family());
     assert!(!ContainerFormat::Mp4.is_matroska_family());
 }
+
+const ASS_SCRIPT: &str = "[Script Info]\nTitle: ass-test\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,Arial,20\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,{\\b1}Hi\\Nthere\nDialogue: 1,0:00:03.00,0:00:04.00,Default,Narrator,10,10,10,Banner,Second line\n";
+
+#[test]
+fn mkv_ass_track_roundtrip() {
+    use muxfin::codec::ass::{codec_private_from_script, parse_dialogue_events};
+
+    let codec_private = codec_private_from_script(ASS_SCRIPT).expect("styles section");
+    let (writer, buffer) = SharedBuffer::new();
+    let mut muxer = MuxerBuilder::new(writer)
+        .video(VideoCodec::H264, 640, 480, 30.0)
+        .with_ass_codec_private(codec_private.clone())
+        .subtitle(SubtitleCodec::Ass, Some("eng".to_string()))
+        .build_mkv()
+        .unwrap();
+
+    muxer
+        .write_video(0.0, &build_h264_keyframe(), true)
+        .unwrap();
+    let events = parse_dialogue_events(ASS_SCRIPT);
+    assert_eq!(events.len(), 2);
+    muxer.write_ass_event(1.0, 1.5, 1, &events[0]).unwrap();
+    muxer.write_ass_event(3.0, 1.0, 2, &events[1]).unwrap();
+    muxer.finish().unwrap();
+
+    let produced = buffer.lock().unwrap();
+    let mkv = open_demuxed(&produced);
+    let subtitle_no: u64;
+    let private: Vec<u8>;
+    {
+        let subtitle = mkv
+            .tracks()
+            .iter()
+            .find(|t| t.track_type() == TrackType::Subtitle)
+            .expect("subtitle track");
+        assert_eq!(clean(subtitle.codec_id()), "S_TEXT/ASS");
+        private = subtitle.codec_private().unwrap_or(&[]).to_vec();
+        subtitle_no = subtitle.track_number().get();
+    }
+    assert_eq!(private, codec_private, "CodecPrivate must round-trip");
+
+    let mut mkv = mkv;
+    let mut frame = matroska_demuxer::Frame::default();
+    let mut blocks = Vec::new();
+    while mkv.next_frame(&mut frame).unwrap() {
+        if frame.track == subtitle_no {
+            blocks.push(String::from_utf8(frame.data.clone()).unwrap());
+        }
+        frame = matroska_demuxer::Frame::default();
+    }
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0], "1,0,Default,,0,0,0,,{\\b1}Hi\\Nthere");
+    assert_eq!(blocks[1], "2,1,Default,Narrator,10,10,10,Banner,Second line");
+}
+
+#[test]
+fn mkv_ass_requires_codec_private() {
+    let (writer, _buffer) = SharedBuffer::new();
+    let result = MuxerBuilder::new(writer)
+        .video(VideoCodec::H264, 640, 480, 30.0)
+        .subtitle(SubtitleCodec::Ass, Some("eng".to_string()))
+        .build_mkv();
+    let err = match result {
+        Ok(_) => panic!("ASS without CodecPrivate must fail"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("CodecPrivate"), "unexpected: {err}");
+}
+
+#[test]
+fn mp4_rejects_ass_subtitles() {
+    let (writer, _buffer) = SharedBuffer::new();
+    let result = MuxerBuilder::new(writer)
+        .video(VideoCodec::H264, 640, 480, 30.0)
+        .subtitle(SubtitleCodec::Ass, Some("eng".to_string()))
+        .build();
+    let err = match result {
+        Ok(_) => panic!("ASS in MP4 must fail"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("Matroska"),
+        "unexpected: {err}"
+    );
+}
+
+#[test]
+fn mkv_write_ass_event_rejected_on_utf8_track() {
+    use muxfin::codec::ass::parse_dialogue_events;
+
+    let (writer, _buffer) = SharedBuffer::new();
+    let mut muxer = MuxerBuilder::new(writer)
+        .video(VideoCodec::H264, 640, 480, 30.0)
+        .subtitle(SubtitleCodec::MovText, Some("eng".to_string()))
+        .build_mkv()
+        .unwrap();
+    muxer
+        .write_video(0.0, &build_h264_keyframe(), true)
+        .unwrap();
+    let events = parse_dialogue_events(ASS_SCRIPT);
+    let err = muxer
+        .write_ass_event(1.0, 1.5, 1, &events[0])
+        .expect_err("write_ass_event on UTF8 track must fail");
+    assert!(
+        err.to_string().contains("SubtitleNotConfigured")
+            || err.to_string().contains("not configured"),
+        "unexpected: {err}"
+    );
+}

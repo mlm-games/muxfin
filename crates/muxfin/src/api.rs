@@ -102,6 +102,10 @@ pub enum SubtitleCodec {
     MovText,
     /// WebVTT cue inside `vttc` (`wvtt` sample entry).
     WebVtt,
+    /// SubStation Alpha (`S_TEXT/SSA` in Matroska). Not valid in MP4.
+    Ssa,
+    /// Advanced SubStation Alpha (`S_TEXT/ASS` in Matroska). Not valid in MP4.
+    Ass,
 }
 
 /// Caller-supplied decoder configuration (verdict §8).
@@ -174,6 +178,8 @@ impl fmt::Display for SubtitleCodec {
         match self {
             SubtitleCodec::MovText => write!(f, "mov_text"),
             SubtitleCodec::WebVtt => write!(f, "webvtt"),
+            SubtitleCodec::Ssa => write!(f, "ssa"),
+            SubtitleCodec::Ass => write!(f, "ass"),
         }
     }
 }
@@ -217,6 +223,8 @@ impl std::str::FromStr for SubtitleCodec {
         match s.to_lowercase().as_str() {
             "mov_text" | "movtext" | "tx3g" => Ok(SubtitleCodec::MovText),
             "webvtt" | "wvtt" | "vtt" => Ok(SubtitleCodec::WebVtt),
+            "ssa" | "s_text/ssa" => Ok(SubtitleCodec::Ssa),
+            "ass" | "s_text/ass" => Ok(SubtitleCodec::Ass),
             _ => Err(format!("Unknown subtitle codec: {}", s)),
         }
     }
@@ -423,6 +431,9 @@ pub struct MuxerBuilder<Writer> {
     vp9_config: Option<crate::codec::vp9::Vp9Config>,
     /// FLAC STREAMINFO (34 bytes) for FLAC audio tracks.
     flac_streaminfo: Option<Vec<u8>>,
+    /// ASS/SSA CodecPrivate for Matroska `S_TEXT/ASS` / `S_TEXT/SSA`
+    /// subtitle tracks: the `[Script Info]` + `[V4(+?) Styles]` sections.
+    ass_codec_private: Option<Vec<u8>>,
     /// Opus pre-skip override (48 kHz samples) for Opus audio tracks.
     opus_preskip: Option<u16>,
     /// Output container selected for [`MuxerBuilder::build_mkv`].
@@ -474,6 +485,7 @@ impl<Writer> MuxerBuilder<Writer> {
             av1_sequence_header: None,
             vp9_config: None,
             flac_streaminfo: None,
+            ass_codec_private: None,
             opus_preskip: None,
             container: ContainerFormat::Mp4,
             video_decoder_config: None,
@@ -504,6 +516,7 @@ impl<Writer> MuxerBuilder<Writer> {
             codec,
             language,
             timescale: 1_000,
+            ass_codec_private: self.ass_codec_private.clone(),
         });
         self
     }
@@ -519,6 +532,7 @@ impl<Writer> MuxerBuilder<Writer> {
             codec,
             language,
             timescale: timescale.max(1),
+            ass_codec_private: self.ass_codec_private.clone(),
         });
         self
     }
@@ -644,6 +658,19 @@ impl<Writer> MuxerBuilder<Writer> {
         self
     }
 
+    /// Set the ASS/SSA CodecPrivate for Matroska subtitle tracks.
+    ///
+    /// Required when the subtitle codec is [`SubtitleCodec::Ssa`] or
+    /// [`SubtitleCodec::Ass`]: per the Matroska codec mapping the
+    /// `[Script Info]` and `[V4(+?) Styles]` sections live in CodecPrivate
+    /// while each `Dialogue:` event is stored in its own Block. Use
+    /// [`crate::codec::ass::codec_private_from_script`] to build it from a
+    /// full ASS/SSA script. Ignored for other subtitle codecs.
+    pub fn with_ass_codec_private(mut self, codec_private: Vec<u8>) -> Self {
+        self.ass_codec_private = Some(codec_private);
+        self
+    }
+
     /// Override the Opus pre-skip signalled in `dOps`/`OpusHead`.
     ///
     /// Defaults to 312 samples when unset. Set it from
@@ -733,6 +760,20 @@ impl<Writer> MuxerBuilder<Writer> {
 
         let subtitle_track = self.subtitle;
 
+        if let Some(subtitle) = &subtitle_track
+            && matches!(
+                subtitle.codec,
+                SubtitleCodec::Ssa | SubtitleCodec::Ass
+            )
+        {
+            return Err(MuxerError::UnsupportedForContainer {
+                codec: subtitle.codec.to_string(),
+                container: ContainerFormat::Mp4.to_string(),
+                reason: "SSA/ASS subtitles are Matroska-only; use build_mkv() for S_TEXT/SSA or S_TEXT/ASS"
+                    .to_string(),
+            });
+        }
+
         if subtitle_track.is_some() && video_track.is_none() {
             return Err(MuxerError::SubtitleRequiresVideo);
         }
@@ -795,6 +836,7 @@ impl<Writer> MuxerBuilder<Writer> {
             writer.enable_subtitle(Mp4SubtitleTrack {
                 codec: subtitle.codec,
                 language: subtitle.language.clone(),
+                ass_codec_private: subtitle.ass_codec_private.clone(),
             });
         }
 
@@ -875,6 +917,20 @@ impl<Writer> MuxerBuilder<Writer> {
 
         let subtitle_track = self.subtitle;
 
+        if let Some(subtitle) = &subtitle_track
+            && matches!(
+                subtitle.codec,
+                SubtitleCodec::Ssa | SubtitleCodec::Ass
+            )
+        {
+            return Err(MuxerError::UnsupportedForContainer {
+                codec: subtitle.codec.to_string(),
+                container: ContainerFormat::Mp4.to_string(),
+                reason: "SSA/ASS subtitles are Matroska-only; use build_mkv() for S_TEXT/SSA or S_TEXT/ASS"
+                    .to_string(),
+            });
+        }
+
         if subtitle_track.is_some() && video_track.is_none() {
             return Err(MuxerError::SubtitleRequiresVideo);
         }
@@ -935,6 +991,7 @@ impl<Writer> MuxerBuilder<Writer> {
             state.enable_subtitle(Mp4SubtitleTrack {
                 codec: subtitle.codec,
                 language: subtitle.language.clone(),
+                ass_codec_private: subtitle.ass_codec_private.clone(),
             });
         }
 
@@ -1132,6 +1189,19 @@ impl<Writer> MuxerBuilder<Writer> {
 
         let subtitle_track = self.subtitle;
 
+        if let Some(subtitle) = &subtitle_track
+            && matches!(
+                subtitle.codec,
+                SubtitleCodec::Ssa | SubtitleCodec::Ass
+            )
+            && subtitle.ass_codec_private.is_none()
+        {
+            return Err(MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SSA/ASS subtitle tracks require CodecPrivate: call with_ass_codec_private() (or build it with codec::ass::codec_private_from_script())",
+            )));
+        }
+
         if subtitle_track.is_some() && video_track.is_none() {
             return Err(MuxerError::SubtitleRequiresVideo);
         }
@@ -1196,6 +1266,7 @@ impl<Writer> MuxerBuilder<Writer> {
             writer.enable_subtitle(Mp4SubtitleTrack {
                 codec: subtitle.codec,
                 language: subtitle.language.clone(),
+                ass_codec_private: subtitle.ass_codec_private.clone(),
             });
         }
 
@@ -1474,6 +1545,9 @@ pub struct SubtitleTrackConfig {
     pub language: Option<String>,
     /// Track timescale (default 1_000). Caller-overridable (verdict §3).
     pub timescale: u32,
+    /// ASS/SSA CodecPrivate (`[Script Info]` + `[V4(+?) Styles]`).
+    /// Required for `Ssa`/`Ass`, ignored otherwise.
+    pub ass_codec_private: Option<Vec<u8>>,
 }
 
 /// Opaque muxer type.  Users interact with this type to write frames
@@ -2242,6 +2316,11 @@ impl<Writer: Write> Muxer<Writer> {
                         .map_err(|_| MuxerError::SubtitleTooLarge(0))?
                 }
                 SubtitleCodec::WebVtt => Vec::new(),
+                SubtitleCodec::Ssa | SubtitleCodec::Ass => {
+                    unreachable!(
+                        "SSA/ASS subtitles are Matroska-only (rejected in MuxerBuilder::build)"
+                    )
+                }
             };
             if !filler.is_empty() {
                 let gap = pts_u - expected_pts;
@@ -2252,10 +2331,25 @@ impl<Writer: Write> Muxer<Writer> {
                 self.subtitle_frame_count += 1;
             }
         }
+        // SSA/ASS never reach the MP4 writer: build() rejects them.
+        if matches!(
+            track.codec,
+            SubtitleCodec::Ssa | SubtitleCodec::Ass
+        ) {
+            return Err(MuxerError::UnsupportedForContainer {
+                codec: track.codec.to_string(),
+                container: ContainerFormat::Mp4.to_string(),
+                reason: "SSA/ASS subtitles are Matroska-only; use build_mkv()"
+                    .to_string(),
+            });
+        }
         let encoded = match track.codec {
             SubtitleCodec::MovText => {
                 crate::muxer::mp4::Mp4Writer::<Vec<u8>>::encode_tx3g_sample(cue.text)
                     .map_err(|_| MuxerError::SubtitleTooLarge(cue.text.len()))?
+            }
+            SubtitleCodec::Ssa | SubtitleCodec::Ass => {
+                unreachable!("checked above")
             }
             SubtitleCodec::WebVtt => {
                 // Minimal vttc: `vttc` box with `payl` payload.
@@ -2969,10 +3063,25 @@ impl<Writer: Write + std::io::Seek> StreamingMuxer<Writer> {
             return Err(MuxerError::ZeroDuration);
         }
         let pts_u = u64::try_from(pts_i64).map_err(|_| MuxerError::TimestampOverflow)?;
+        // SSA/ASS never reach the MP4 writer: build() rejects them.
+        if matches!(
+            track.codec,
+            SubtitleCodec::Ssa | SubtitleCodec::Ass
+        ) {
+            return Err(MuxerError::UnsupportedForContainer {
+                codec: track.codec.to_string(),
+                container: ContainerFormat::Mp4.to_string(),
+                reason: "SSA/ASS subtitles are Matroska-only; use build_mkv()"
+                    .to_string(),
+            });
+        }
         let encoded = match track.codec {
             SubtitleCodec::MovText => {
                 crate::muxer::mp4::Mp4Writer::<Vec<u8>>::encode_tx3g_sample(cue.text)
                     .map_err(|_| MuxerError::SubtitleTooLarge(cue.text.len()))?
+            }
+            SubtitleCodec::Ssa | SubtitleCodec::Ass => {
+                unreachable!("checked above")
             }
             SubtitleCodec::WebVtt => {
                 let mut vttc_payload = Vec::new();
@@ -3340,6 +3449,101 @@ impl<Writer: Write> MkvMuxer<Writer> {
     /// `pts` is the presentation timestamp in seconds and `duration` is the
     /// sample duration in seconds. `text` is a UTF-8 subtitle payload stored
     /// as `S_TEXT/UTF8`. (WebM rejects subtitles; use Matroska instead.)
+
+    /// Write one ASS/SSA `Dialogue:` event to the container.
+    ///
+    /// Only valid when the subtitle track was configured with
+    /// [`SubtitleCodec::Ssa`] or [`SubtitleCodec::Ass`]. The event is
+    /// stored as a single Block with the Matroska payload
+    /// `ReadOrder,Layer,Style,Name,MarginL,MarginR,MarginV,Effect,Text`.
+    /// `read_order` is the 1-based Dialogue index in file order. `text`
+    /// keeps ASS override tags and `\N` escapes verbatim.
+    pub fn write_ass_event(
+        &mut self,
+        pts: f64,
+        duration: f64,
+        read_order: u32,
+        event: &crate::codec::ass::AssEvent,
+    ) -> Result<(), MuxerError> {
+        if !matches!(
+            self.subtitle_track.as_ref().map(|t| t.codec),
+            Some(SubtitleCodec::Ssa) | Some(SubtitleCodec::Ass)
+        ) {
+            return Err(MuxerError::SubtitleNotConfigured);
+        }
+        if read_order == 0 {
+            return Err(MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ASS read_order is 1-based and must be non-zero",
+            )));
+        }
+        let payload = crate::codec::ass::encode_block_payload(read_order, event);
+        let text = String::from_utf8(payload).map_err(|_| {
+            MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ASS event payload must be valid UTF-8",
+            ))
+        })?;
+        self.write_subtitle_raw(pts, duration, text.as_bytes())
+    }
+
+    /// Write raw subtitle bytes to the container without text encoding.
+    ///
+    /// Shared by [`MkvMuxer::write_subtitle`] (UTF-8 text) and
+    /// [`MkvMuxer::write_ass_event`] (pre-encoded ASS payload).
+    fn write_subtitle_raw(
+        &mut self,
+        pts: f64,
+        duration: f64,
+        data: &[u8],
+    ) -> Result<(), MuxerError> {
+        if self.finished {
+            return Err(MuxerError::AlreadyFinished);
+        }
+        if self.subtitle_track.is_none() {
+            return Err(MuxerError::SubtitleNotConfigured);
+        }
+
+        let frame_index = self.subtitle_frame_count;
+
+        if !pts.is_finite() {
+            return Err(MuxerError::InvalidSubtitlePts { pts, frame_index });
+        }
+        if pts < 0.0 {
+            return Err(MuxerError::NegativeSubtitlePts { pts, frame_index });
+        }
+        if !duration.is_finite() || duration <= 0.0 {
+            return Err(MuxerError::InvalidSubtitleDuration {
+                duration_secs: duration,
+                frame_index,
+            });
+        }
+        if data.is_empty() {
+            return Err(MuxerError::EmptySubtitleSample { frame_index });
+        }
+        if let Some(prev) = self.last_subtitle_pts
+            && pts < prev
+        {
+            return Err(MuxerError::DecreasingSubtitlePts {
+                prev_pts: prev,
+                curr_pts: pts,
+                frame_index,
+            });
+        }
+
+        let scaled_pts = (pts * MEDIA_TIMESCALE as f64).round();
+        let pts_units = scaled_pts as u64;
+        let scaled_duration = (duration * MEDIA_TIMESCALE as f64).round().max(1.0);
+        let duration_units = scaled_duration as u32;
+
+        self.writer
+            .write_subtitle_sample(pts_units, duration_units, data)
+            .map_err(|e| self.convert_mkv_error(e, frame_index))?;
+
+        self.last_subtitle_pts = Some(pts);
+        self.subtitle_frame_count += 1;
+        Ok(())
+    }
     pub fn write_subtitle(
         &mut self,
         pts: f64,
@@ -3380,18 +3584,18 @@ impl<Writer: Write> MkvMuxer<Writer> {
             });
         }
 
-        let scaled_pts = (pts * MEDIA_TIMESCALE as f64).round();
-        let pts_units = scaled_pts as u64;
-        let scaled_duration = (duration * MEDIA_TIMESCALE as f64).round().max(1.0);
-        let duration_units = scaled_duration as u32;
-
-        self.writer
-            .write_subtitle_sample(pts_units, duration_units, text.as_bytes())
-            .map_err(|e| self.convert_mkv_error(e, frame_index))?;
-
-        self.last_subtitle_pts = Some(pts);
-        self.subtitle_frame_count += 1;
-        Ok(())
+        // SSA/ASS tracks carry Dialogue events via write_ass_event, not
+        // plain text.
+        if matches!(
+            self.subtitle_track.as_ref().map(|t| t.codec),
+            Some(SubtitleCodec::Ssa) | Some(SubtitleCodec::Ass)
+        ) {
+            return Err(MuxerError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SSA/ASS subtitle tracks require write_ass_event(); plain-text write_subtitle() is only for S_TEXT/UTF8",
+            )));
+        }
+        self.write_subtitle_raw(pts, duration, text.as_bytes())
     }
 
     /// Write a video sample with integer timestamps (verdict §§3-4).

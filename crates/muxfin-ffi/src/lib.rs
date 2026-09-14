@@ -268,7 +268,8 @@ pub unsafe extern "C" fn muxfin_builder_flac_streaminfo(
 
 /// Configure the subtitle track.
 ///
-/// `codec`: 0 = mov_text (`tx3g`), 1 = WebVTT (`wvtt`). `lang` is an
+/// `codec`: 0 = mov_text (`tx3g`), 1 = WebVTT (`wvtt`), 2 = SSA
+/// (`S_TEXT/SSA`, Matroska-only), 3 = ASS (`S_TEXT/ASS`, Matroska-only). `lang` is an
 /// optional ISO-639-2/T code (`lang_len` bytes, not null-terminated; may be
 /// null with length 0 for none).
 ///
@@ -290,6 +291,8 @@ pub unsafe extern "C" fn muxfin_builder_subtitle(
     let codec = match codec {
         0 => SubtitleCodec::MovText,
         1 => SubtitleCodec::WebVtt,
+        2 => SubtitleCodec::Ssa,
+        3 => SubtitleCodec::Ass,
         _ => {
             stash_error(format!("unknown subtitle codec code {codec}"));
             return MuxfinStatus::InvalidArgument;

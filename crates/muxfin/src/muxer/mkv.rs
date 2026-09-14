@@ -569,8 +569,13 @@ impl<Writer: Write> MkvWriter<Writer> {
                 });
             }
             if has_subtitle {
+                let codec = self
+                    .subtitle_track
+                    .as_ref()
+                    .map(|t| t.codec.to_string())
+                    .unwrap_or_else(|| "subtitle".to_string());
                 return Err(MkvWriterError::UnsupportedForWebM {
-                    codec: "mov_text".to_string(),
+                    codec,
                     reason: "WebM subtitles require WebVTT; use Matroska (.mkv) for text subtitles"
                         .to_string(),
                 });
@@ -949,11 +954,24 @@ fn build_audio_track(
 
 fn build_subtitle_track(track: &Mp4SubtitleTrack, language: &str) -> TrackEntry {
     let track_language = track.language.as_deref().unwrap_or(language);
+    let (codec_id, codec_private) = match track.codec {
+        crate::api::SubtitleCodec::MovText | crate::api::SubtitleCodec::WebVtt => {
+            ("S_TEXT/UTF8", None)
+        }
+        crate::api::SubtitleCodec::Ssa => (
+            "S_TEXT/SSA",
+            track.ass_codec_private.clone(),
+        ),
+        crate::api::SubtitleCodec::Ass => (
+            "S_TEXT/ASS",
+            track.ass_codec_private.clone(),
+        ),
+    };
     base_track(
         SUBTITLE_TRACK_NUMBER,
         17,
-        "S_TEXT/UTF8",
-        None,
+        codec_id,
+        codec_private,
         track_language,
     )
 }

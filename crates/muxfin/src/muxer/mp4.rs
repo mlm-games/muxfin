@@ -77,6 +77,9 @@ pub struct Mp4AudioTrack {
 pub struct Mp4SubtitleTrack {
     pub codec: SubtitleCodec,
     pub language: Option<String>,
+    /// ASS/SSA CodecPrivate for Matroska `S_TEXT/ASS` / `S_TEXT/SSA`.
+    /// Ignored by the MP4 writer (which rejects those codecs at build).
+    pub ass_codec_private: Option<Vec<u8>>,
 }
 
 pub(crate) struct SampleInfo {
@@ -2146,6 +2149,9 @@ fn build_subtitle_stsd_box(subtitle: &Mp4SubtitleTrack) -> Vec<u8> {
     let sample_entry_box = match subtitle.codec {
         SubtitleCodec::MovText => build_tx3g_box(),
         SubtitleCodec::WebVtt => build_wvtt_box(),
+        SubtitleCodec::Ssa | SubtitleCodec::Ass => {
+            unreachable!("SSA/ASS subtitles are Matroska-only (rejected in MuxerBuilder::build)")
+        }
     };
 
     let mut payload = Vec::new();

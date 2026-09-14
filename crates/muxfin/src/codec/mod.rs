@@ -22,6 +22,7 @@
 //! The muxer internally converts to length-prefixed format (AVCC/HVCC) for MP4.
 
 pub mod access_unit;
+pub mod ass;
 pub mod av1;
 pub mod common;
 pub mod flac;
@@ -30,6 +31,7 @@ pub mod h265;
 pub mod opus;
 pub mod vp9;
 
+pub use ass::{AssEvent, codec_private_from_script, encode_block_payload, parse_dialogue_events};
 pub use common::{AnnexBNalIter, find_start_code};
 pub use flac::{
     FlacFrameHeader, FlacMetadataBlock, FlacStreaminfo,
